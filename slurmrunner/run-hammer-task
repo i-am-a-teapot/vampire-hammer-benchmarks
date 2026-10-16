@@ -1,0 +1,637 @@
+#!/usr/bin/env python3
+"""Run the hammer on one mathlib theorem: the executable of the BenchExec tool.
+
+The task file contains the fully qualified theorem name on its first line.
+The theorem's own statement is elaborated by `hammer_mathlib_try`, which
+kernel-checks the reconstructed proof and audits it for target reuse; the
+original proof is never supplied. The final output line is
+
+    HAMMER-RESULT: {"name": ..., "status": ..., "failure_kind": ..., ...}
+
+and the tool-info module (`hammer_bench/tool_info.py`) derives the BenchExec
+status from it. Resource limits are left to BenchExec, except Vampire's own
+search budget and memory limit, which keep the same meaning as in
+`scripts/benchmark-mathlib.py`.
+"""
+
+import argparse
+import importlib.util
+import json
+import math
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+PROJECT = Path(__file__).resolve().parents[1]
+RESULT_PREFIX = "HAMMER-RESULT: "
+
+_spec = importlib.util.spec_from_file_location("benchmark_mathlib", PROJECT / "scripts/benchmark-mathlib.py")
+benchmark = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(benchmark)
+
+
+def load_config(path):
+    if path is None:
+        return {}
+    return json.loads(Path(path).read_text())
+
+
+def lean_command(config, source):
+    """Use the suite's recorded Lean environment and native-library flags;
+    fall back to `lake lean`. Both load the precompiled hammer and lean-auto
+    code, which `lake env lean` alone would interpret."""
+    # Line-buffer Lean's stdio, so a run killed at a time limit still logs the
+    # diagnostic messages it reached.
+    unbuffered = ["stdbuf", "-oL", "-eL"] if shutil.which("stdbuf") else []
+    if config.get("lean"):
+        env = dict(os.environ)
+        env.update(config.get("lean_env", {}))
+        return [*unbuffered, config["lean"], *config.get("lean_args", []), "-j", "1", str(source)], env
+    return [*unbuffered, *benchmark.lean_command(source)], None
+
+
+def write_case(work, name, wrapper, parser_dynlib, search_seconds, case_options, strategy="hammer",
+               prover="vampire-hammer", imports=None, comparison=False, module=None):
+    """The same command sequence as one entry of a benchmark-mathlib chunk."""
+    (work / "problems").mkdir()
+    events = work / "events.jsonl"
+    source = work / "case.lean"
+    imports = imports or benchmark.IMPORTS
+    if strategy == "lean-auto-style" and module:
+        if any(not part.replace("'", "_").isidentifier() for part in module.split('.')):
+            raise ValueError(f"invalid defining module: {module!r}")
+        # Initialize the defining module through Lean's frontend: loading its
+        # dependencies first inside the interpreted replay harness is costly.
+        # The full outer environment is discarded before tactic evaluation.
+        imports = ''.join(f'import {module}\n' if line.strip() == 'import Mathlib' else line
+                          for line in imports.splitlines(keepends=True))
+    if comparison:
+        # Apply limits before command elaboration as well as inside each case.
+        header_options = ''.join(f'set_option {option} 0\n'
+                                 for option in benchmark.COMPARISON_HEARTBEAT_OPTIONS)
+    else:
+        header_options = ''
+    header = (imports + header_options +
+              f'set_option vampire.benchmarkProver {benchmark.lean_string(prover)}\n' +
+              ('set_option vampire.benchmarkComparison true\n' if comparison else '') +
+              f'set_option vampire.executable {benchmark.lean_string(str(wrapper))}\n'
+              f'set_option vampire.tptpParserDynlib {benchmark.lean_string(str(parser_dynlib))}\n'
+              'set_option Elab.async false\n'
+              # Expose diagnostic events before the command finishes, so
+              # time-limited benchmark logs retain failure details.
+              'set_option stderrAsMessages false\n')
+    row = {"id": 0, "name": name}
+    command = benchmark.case_command(row, work, events, search_seconds, case_options)
+    if strategy == "lean-auto-style":
+        if module:
+            command = command.replace("hammer_mathlib_try ", "hammer_mathlib_try_with_premises_in_module ", 1)
+            command = command.replace(" recording ", f" module {benchmark.lean_string(module)} recording ", 1)
+        else:
+            command = command.replace("hammer_mathlib_try ", "hammer_mathlib_try_with_premises ", 1)
+    if prover in {"lean-auto-duper", "lean-smt"}:
+        header = ''.join(line for line in header.splitlines(keepends=True)
+                         if not line.startswith(('set_option vampire.executable ',
+                                                 'set_option vampire.tptpParserDynlib ')))
+    if prover in {"lean-auto-duper", "lean-smt"}:
+        command = ''.join(line for line in command.splitlines(keepends=True)
+                          if not line.startswith(('set_option vampire.timeLimit ',
+                                                  'set_option vampire.diagnosticCase ',
+                                                  'set_option vampire.outputPath ')))
+    source.write_text(header + command)
+    return source, events
+
+
+def read_events(events):
+    if not events.exists():
+        return []
+    return [json.loads(line) for line in events.read_text().splitlines() if line.endswith("}")]
+
+
+class EventReader:
+    """Read only appended complete JSONL records, retaining partial writes."""
+    def __init__(self, path):
+        self.path, self.offset, self.pending = path, 0, b''
+
+    def read(self):
+        try:
+            with self.path.open('rb') as stream:
+                stream.seek(self.offset)
+                data = stream.read()
+                self.offset = stream.tell()
+        except FileNotFoundError:
+            return []
+        lines = (self.pending + data).split(b'\n')
+        self.pending = lines.pop()
+        return [json.loads(line) for line in lines if line.strip()]
+
+
+def proof_event_start(event, observed):
+    # On Linux Lean's std::chrono::steady_clock and Python's monotonic clock
+    # use CLOCK_MONOTONIC. Legacy events retain observation-based timing.
+    stamp = event.get('monotonic_ns')
+    if sys.platform.startswith('linux') and isinstance(stamp, int) and not isinstance(stamp, bool):
+        value = stamp / 1_000_000_000
+        if value < 0 or value > observed + 0.1:
+            raise ValueError('invalid Lean monotonic proof-start timestamp')
+        return value
+    return observed
+
+
+def wait_for_lean(process, events, wall_timeout=None, proof_timeout=None, started=None):
+    """Enforce elapsed time around the proof, excluding imports/replay/audit.
+
+    The proof_checked event is emitted only after addDecl returns from the
+    kernel. The final audit is still bounded by the whole-process limit.
+    """
+    started = time.monotonic() if started is None else started
+    reader = EventReader(events)
+    proof_started = None
+    proof_done = False
+    while True:
+        for event in reader.read():
+            if event.get('event') == 'started' and proof_started is None:
+                proof_started = proof_event_start(event, time.monotonic())
+            if event.get('event') in {'proof_checked', 'finished'}:
+                proof_done = True
+        code = process.poll()
+        # Check budgets even if Lean has just exited. Measured success time
+        # is also checked by apply_success_limit, independently of polling.
+        now = time.monotonic()
+        if proof_timeout is not None and proof_started is not None and not proof_done and now - proof_started >= proof_timeout:
+            if code is None:
+                kill_tree(process)
+            return process.returncode, 'proof_timeout'
+        if wall_timeout is not None and now - started >= wall_timeout:
+            if code is None:
+                kill_tree(process)
+            return process.returncode, 'timeout'
+        if code is not None:
+            return code, None
+        time.sleep(0.01)
+
+
+# Case options that only one prover registers, by option name.
+PROVER_OPTIONS = {"maxSaturationIteration": {"duper", "lean-auto-duper"}}
+
+
+def classify(name, events, returncode):
+    """Mirror run_chunk's handling of missing terminal events."""
+    finished = [event for event in events if event.get("event") == "finished"]
+    if finished:
+        return finished[-1]
+    if any(event.get("event") == "started" for event in events):
+        # Lean aborted the command (e.g. heartbeat or recursion limit inside
+        # code that does not raise through the harness) or crashed mid-case.
+        return {"event": "finished", "name": name, "status": "process_error",
+                "error": f"Lean exited with code {returncode} without completing this case",
+                "kernel_checked": False}
+    return {"event": "finished", "name": name, "status": "infrastructure_error",
+            "error": f"Lean exited with code {returncode} before starting this case (import failure?)",
+            "kernel_checked": False}
+
+
+def apply_success_limit(event, seconds):
+    """A reconstructed proof over the evaluation budget is not a benchmark solve."""
+    event = dict(event)
+    if seconds is not None and event.get("status") == "proved":
+        measured = event.get("seconds")
+        if isinstance(measured, bool) or not isinstance(measured, (int, float)) or not math.isfinite(measured) or measured < 0:
+            event.update(status="infrastructure_error", error="proof result has no measured proof time")
+        elif measured > seconds:
+            event.update(status="proof_timeout", proved_outside_budget=True,
+                         error=f"kernel-checked proof took {measured:.3f}s, exceeding the {seconds:g}s success budget")
+    return event
+
+
+def compact_baseline_result(event):
+    """Keep comparison outcomes, budgets and proof checks without diagnostics."""
+    keys = {'name', 'status', 'failure_kind', 'prover', 'route', 'kernel_checked',
+            'seconds', 'replay_seconds', 'wall_seconds', 'lean_returncode',
+            'evaluation_strategy', 'success_budget', 'proved_outside_budget', 'exclusion_reason'}
+    return {key: value for key, value in event.items() if key in keys}
+
+
+def task_theorem(path):
+    """A .thm file holds the name; a BenchExec .yml task names it under options."""
+    text = path.read_text()
+    if path.suffix in {".yml", ".yaml"}:
+        match = re.search(r"^\s+theorem:\s*(.+?)\s*$", text, re.M)
+        if match is None:
+            raise SystemExit(f"{path}: no options.theorem entry")
+        return json.loads(match[1]) if match[1].startswith('"') else match[1]
+    return text.splitlines()[0].strip()
+
+
+def task_module(path):
+    """Optional defining-module metadata; old tasks remain valid."""
+    text = path.read_text()
+    if path.suffix in {".yml", ".yaml"}:
+        match = re.search(r"^\s+module:\s*(.+?)\s*$", text, re.M)
+        if match:
+            return json.loads(match[1]) if match[1].startswith('"') else match[1]
+        return None
+    lines = text.splitlines()
+    return lines[1].strip() if len(lines) > 1 and lines[1].strip() else None
+
+
+def output_tail(path, limit=4096):
+    """Bound excerpts without reading a potentially large proof into memory."""
+    if not path.exists():
+        return None
+    with path.open('rb') as stream:
+        stream.seek(0, os.SEEK_END)
+        size = stream.tell()
+        stream.seek(max(0, size - limit))
+        tail = stream.read().decode(errors='replace')
+    return ('[truncated]\n' if size > limit else '') + tail
+
+
+def vampire_details(work, include_output=False, index=0):
+    """Keep first-query compatibility fields and diagnostics for every branch."""
+    problem = work / "problems" / f"{index:05d}.p"
+    queries = benchmark.vampire_problem_files(problem)
+    details = {"vampire_queries": len(queries), "vampire_exit": None, "search_seconds": None,
+               "szs_status": None, "termination_reason": None, "problem_bytes": None, "assertions": None,
+               "record_retry": False, "query_details": []}
+    for query in queries:
+        item = dict.fromkeys(('vampire_exit', 'search_seconds', 'szs_status', 'termination_reason'))
+        item['problem'] = query.name
+        text = query.read_text(errors="replace")
+        item["problem_bytes"] = query.stat().st_size
+        item["assertions"] = len(re.findall(
+            r"(?m)^t[fh]f\([^\n]*?,\s*(?:axiom|hypothesis|conjecture|negated_conjecture)\s*,", text))
+        item["record_retry"] = Path(str(query) + ".with-record-laws").exists()
+        exitfile = Path(str(query) + ".exitcode")
+        if exitfile.exists():
+            try:
+                item["vampire_exit"] = int(exitfile.read_text())
+            except ValueError:
+                item['exitcode_error'] = 'incomplete or invalid exitcode file'
+        stdout = Path(str(query) + ".stdout")
+        if stdout.exists():
+            output = stdout.read_text(errors="replace")
+            times = re.findall(r"% Time elapsed: ([0-9.]+) s", output)
+            item["search_seconds"] = float(times[-1]) if times else None
+            statuses = re.findall(r"^% SZS status (\S+)", output, re.M)
+            item["szs_status"] = statuses[-1] if statuses else None
+            reasons = re.findall(r"^% Termination reason: (.+)$", output, re.M)
+            item["termination_reason"] = reasons[-1] if reasons else None
+            # The final portfolio wall time follows all worker summaries.
+            # A worker's last 'Time elapsed' may be only a tiny time slice.
+            portfolio_times = re.findall(r"% Proof not found in time ([0-9.]+) s", output)
+            if item["szs_status"] == "Timeout" and portfolio_times:
+                item["search_seconds"] = float(portfolio_times[-1])
+        if include_output:
+            item['stdout_tail'] = output_tail(stdout)
+            item['stderr_tail'] = output_tail(Path(str(query) + '.stderr'))
+            for suffix in ('stdout', 'stderr', 'exitcode'):
+                precheck = output_tail(Path(str(query) + '.fmb.' + suffix))
+                if precheck is not None:
+                    item['sat_precheck_' + suffix] = precheck
+        details['query_details'].append(item)
+    if details['query_details']:
+        first = details['query_details'][0]
+        details.update({key: first[key] for key in details if key in first})
+    return details
+
+
+def kill_tree(process):
+    """Kill Lean and the Vampire processes it started.
+
+    Lean stays in our process group, so a benchmarking tool that kills our
+    group at its time limit also reaches Lean and Vampire.
+    """
+    # Freeze the parent before discovering descendants, then freeze each
+    # discovered child. Rescan until no more can fork before killing leaves.
+    if process.poll() is not None:
+        return
+    victims = {process.pid}
+    def send(pid, sig):
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            pass
+    send(process.pid, signal.SIGSTOP)
+    try:
+        while True:
+            children = {}
+            for stat in Path("/proc").glob("[0-9]*/stat"):
+                try:
+                    fields = stat.read_text().rsplit(")", 1)[1].split()
+                except (OSError, IndexError):
+                    continue
+                children.setdefault(int(fields[1]), []).append(int(stat.parent.name))
+            pending, discovered = list(victims), set(victims)
+            while pending:
+                for child in children.get(pending.pop(), []):
+                    if child not in discovered:
+                        discovered.add(child)
+                        pending.append(child)
+            new = discovered - victims
+            for pid in new:
+                send(pid, signal.SIGSTOP)
+            victims = discovered
+            if not new:
+                break
+    finally:
+        for pid in victims - {process.pid}:
+            send(pid, signal.SIGKILL)
+        send(process.pid, signal.SIGKILL)
+        process.wait()
+
+
+def write_batch_case(work, names, wrapper, parser_dynlib, search_seconds, case_options, prover,
+                     imports, comparison, module):
+    """One case replaying the defining module once for several targets."""
+    source, events = write_case(work, names[0], wrapper, parser_dynlib, search_seconds, case_options,
+                                "lean-auto-style", prover, imports, comparison, module)
+    single = f'hammer_mathlib_try_with_premises_in_module {benchmark.lean_string(names[0])} module'
+    text = source.read_text()
+    if single not in text:
+        raise ValueError("batched cases require the defining-module replay command")
+    source.write_text(text.replace(
+        single, f'hammer_mathlib_try_batch_in_module {benchmark.lean_string(" ".join(names))} module', 1))
+    return source, events
+
+
+def wait_for_batch(process, events, wall_timeout=None, proof_timeout=None, started=None):
+    """`wait_for_lean` for several targets proved one after another: each
+    target's proof budget starts at its own `started` event. Returns the exit
+    code, the kind of kill, and the target that was being proved."""
+    started = time.monotonic() if started is None else started
+    reader = EventReader(events)
+    proof_started = {}
+    done = set()
+    while True:
+        for event in reader.read():
+            name = event.get('name')
+            if event.get('event') == 'started' and name not in proof_started:
+                proof_started[name] = proof_event_start(event, time.monotonic())
+            if event.get('event') in {'proof_checked', 'finished'}:
+                done.add(name)
+        code = process.poll()
+        now = time.monotonic()
+        active = [name for name in proof_started if name not in done]
+        if proof_timeout is not None and active and now - proof_started[active[0]] >= proof_timeout:
+            if code is None:
+                kill_tree(process)
+            return process.returncode, 'proof_timeout', active[0]
+        if wall_timeout is not None and now - started >= wall_timeout:
+            if code is None:
+                kill_tree(process)
+            return process.returncode, 'timeout', active[0] if active else None
+        if code is not None:
+            return code, None, active[0] if active else None
+        time.sleep(0.01)
+
+
+def run_batch(args, config, project, names, module, wrapper_for, parser_dynlib, search_seconds,
+              case_options, work, report=None):
+    """Prove several targets of one module in as few Lean processes as possible.
+    A proof timeout or crash ends the process; the targets it had not reached
+    run again in a fresh process, so each still gets its own budget.
+    `report(name, entry)` runs as soon as a target has its final result."""
+    wall_timeout = args.wall_timeout if args.wall_timeout is not None else config.get('process_wall_seconds')
+    proof_timeout = args.proof_timeout if args.proof_timeout is not None else config.get('proof_timeout_seconds')
+    remaining, results, attempt = list(names), {}, 0
+    while remaining:
+        attempt += 1
+        directory = work / f"attempt-{attempt}"
+        directory.mkdir()
+        source, events = write_batch_case(directory, remaining, wrapper_for(directory), parser_dynlib,
+                                          search_seconds, case_options, args.prover,
+                                          config.get('benchmark_imports'), config.get('comparison', False),
+                                          module)
+        command, env = lean_command(config, source)
+        print(f"[run-hammer-task] batch of {len(remaining)} in {module}; attempt {attempt}", flush=True)
+        started = time.monotonic()
+        process = subprocess.Popen(command, cwd=project if env is None else directory, env=env,
+                                   stdout=sys.stdout if args.prover == 'vampire-hammer' else subprocess.DEVNULL,
+                                   stderr=subprocess.STDOUT)
+        try:
+            returncode, killed, culprit = wait_for_batch(process, events, wall_timeout, proof_timeout, started=started)
+        except BaseException:
+            kill_tree(process)
+            raise
+        wall = time.monotonic() - started
+        recorded = read_events(events)
+        progressed = False
+        for index, name in enumerate(remaining):
+            own = [row for row in recorded if row.get('name') == name]
+            finished = [row for row in own if row.get('event') == 'finished']
+            replayed = [row for row in own if row.get('event') == 'replay_finished']
+            if finished:
+                event = dict(finished[-1])
+            elif name == culprit and killed:
+                event = {"event": "finished", "name": name, "status": killed, "kernel_checked": False,
+                         "seconds": proof_timeout if killed == 'proof_timeout' else None,
+                         "error": f"{'proof' if killed == 'proof_timeout' else 'process'} wall timeout of "
+                                  f"{proof_timeout if killed == 'proof_timeout' else wall_timeout}s"}
+            elif name == culprit or killed == 'timeout':
+                event = classify(name, own, returncode)
+            else:
+                continue
+            progressed = True
+            if replayed:
+                event.setdefault("replay_seconds", replayed[-1].get("replay_seconds"))
+            results[name] = (event, directory, index, source, events, returncode, wall)
+            if report is not None:
+                report(name, results[name])
+        unfinished = [name for name in remaining if name not in results]
+        if not progressed:
+            # The process failed before any target: do not loop.
+            for name in unfinished:
+                own = [row for row in recorded if row.get('name') == name]
+                results[name] = (classify(name, own, returncode), directory, remaining.index(name),
+                                 source, events, returncode, wall)
+                if report is not None:
+                    report(name, results[name])
+            unfinished = []
+        remaining = unfinished
+    return results
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("task", type=Path, nargs="?",
+                        help="a .thm file whose first line is the theorem name, or its .yml task definition")
+    parser.add_argument("--theorem", action="append",
+                        help="theorem name instead of a task file; repeat it for several theorems of one "
+                             "--module, whose file is then replayed once (lean-auto-style suites)")
+    parser.add_argument("--module", help="defining module from the suite catalog; avoids full Mathlib startup for declaration replay")
+    parser.add_argument("--config", help="suite-config.json written by make-suite.py")
+    parser.add_argument("--prover", choices=("vampire-hammer", "lean-auto-duper", "lean-smt", "duper", "aesop", "simp_all", "grind"),
+                        default="vampire-hammer", help="tactic to evaluate (baselines require the comparison imports)")
+    parser.add_argument("--search-seconds", type=int, default=None, help="Vampire search budget (default: suite config, else 20)")
+    parser.add_argument("--vampire-memory-mib", type=int, default=None, help="Vampire memory limit (default: suite config, else 512)")
+    parser.add_argument("--case-option", action="append", default=[], metavar="NAME=VALUE",
+                        help="extra 'set_option NAME VALUE in' for this case (repeatable)")
+    parser.add_argument("--keep-artifacts", action="store_true",
+                        help="copy the Lean case, events and Vampire problems/outputs to --artifacts-dir")
+    parser.add_argument("--artifacts-dir", default="hammer-artifacts",
+                        help="relative to the working directory; each task uses its own subdirectory")
+    parser.add_argument("--wall-timeout", type=float, default=None,
+                        help="kill Lean after this many seconds; only for use outside BenchExec")
+    parser.add_argument("--proof-timeout", type=float, help="wall-clock proof limit excluding imports/source replay/audit (default: suite config)")
+    parser.add_argument("--version", action="store_true")
+    args = parser.parse_args()
+    config = load_config(args.config)
+    project = Path(config.get("project", PROJECT)).expanduser().resolve()
+
+    if args.version:
+        print(f"vampire-hammer {config.get('hammer_revision', 'unknown')} "
+              f"vampire-sha256:{config.get('vampire_sha256', 'unknown')[:12]}")
+        return 0
+    if (args.task is None) == (args.theorem is None):
+        parser.error("give exactly one of a task file or --theorem")
+    names = args.theorem or [task_theorem(args.task)]
+    name = names[0]
+    module = args.module or (task_module(args.task) if args.task else None)
+    if module and any(not part.replace("'", "_").isidentifier() for part in module.split('.')):
+        parser.error(f"invalid defining module: {module!r}")
+
+    vampire = config.get("vampire") or str(benchmark.vampire_executable(project))
+    expected = config.get("vampire_sha256")
+    if args.prover == 'vampire-hammer' and expected and benchmark.binary_hash(vampire) != expected:
+        print(RESULT_PREFIX + json.dumps({"name": name, "status": "infrastructure_error",
+                                          "failure_kind": "infrastructure_error",
+                                          "error": f"Vampire binary {vampire} differs from the suite fingerprint"}))
+        return 3
+    search_seconds = args.search_seconds or config.get("search_seconds", 20)
+    memory = args.vampire_memory_mib or config.get("vampire_memory_mib", 512)
+    # A comparison suite shares its case options between provers; an option
+    # registered by one prover is unknown to the others' case files.
+    configured_options = config.get("case_options", []) + args.case_option
+    if config.get('comparison'):
+        # Enforce the protocol even with old suite configs or CLI overrides.
+        configured_options = [pair for pair in configured_options
+                              if pair.partition('=')[0] not in benchmark.COMPARISON_HEARTBEAT_OPTIONS]
+        configured_options += [f'{name}=0' for name in benchmark.COMPARISON_HEARTBEAT_OPTIONS]
+    case_options = [pair for pair in configured_options
+                    if args.prover in PROVER_OPTIONS.get(pair.partition("=")[0], {args.prover})
+                    and not (args.prover in {"lean-auto-duper", "lean-smt"} and pair.startswith("vampire."))]
+    case_options = benchmark.case_options_prelude(case_options)
+    strategy = config.get("evaluation_strategy", "hammer")
+    if strategy not in {"hammer", "lean-auto-style"}:
+        parser.error(f"unknown evaluation strategy: {strategy}")
+    parser_dynlib = config.get("tptp_parser_dynlib") or str(
+        benchmark.package_root('tptp_parser', project) / '.lake/build/lib/libtptp_cparser.so')
+
+    proof_limit = args.proof_timeout if args.proof_timeout is not None else config.get('proof_timeout_seconds')
+    success_limit = min((limit for limit in (config.get('success_seconds'), proof_limit) if limit is not None), default=None)
+
+    def finish(name, event, directory, index, source, events, returncode, wall):
+        """Complete one theorem's result line from its recorded events."""
+        event = apply_success_limit(event, success_limit)
+        event.pop("event", None)
+        event['prover'] = args.prover
+        event["failure_kind"] = benchmark.failure_kind(event)
+        if args.prover == 'vampire-hammer':
+            event.update(vampire_details(directory, include_output=event['status'] not in {'proved', 'excluded'},
+                                         index=index))
+        # Only the harness can attribute the accepted proof. Exported inputs
+        # can belong to failed attempts followed by a direct Lean closure.
+        if args.prover == 'vampire-hammer':
+            event.setdefault('route', 'unknown')
+            event.setdefault('route_source', 'unavailable')
+            event['attempted_route'] = 'vampire' if event['vampire_queries'] else 'no_export'
+        else:
+            event['route'] = args.prover
+        event.update({"lean_returncode": returncode, "wall_seconds": round(wall, 3),
+                      "search_budget": search_seconds, "evaluation_strategy": strategy,
+                      "success_budget": success_limit})
+        if len(names) > 1:
+            event['batch_size'] = len(names)
+        if args.keep_artifacts and args.prover == 'vampire-hammer':
+            # Without a container overlay concurrent runs share the working directory.
+            stem = args.task.stem if args.task and len(names) == 1 else name
+            destination = Path(args.artifacts_dir) / args.prover / f'search{search_seconds}' / stem
+            destination.mkdir(parents=True, exist_ok=True)
+            event['artifacts_dir'] = str(destination)
+            problems = sorted((directory / "problems").glob(f"{index:05d}.p*"))
+            for path in [source, events, *problems]:
+                if path.exists():
+                    shutil.copy2(path, destination / path.name)
+        if args.prover != 'vampire-hammer':
+            event = compact_baseline_result(event)
+        return event
+
+    work = Path(tempfile.mkdtemp(prefix="hammer-"))
+    try:
+        if len(names) > 1:
+            if strategy != "lean-auto-style" or not module:
+                parser.error("several --theorem need --module and a lean-auto-style suite")
+            def wrapper_for(directory):
+                return benchmark.bounded_wrapper(directory, vampire, memory)
+            # Report each target as soon as it finishes: a batch killed at the
+            # outer wall deadline keeps the results it already produced.
+            status = [0]
+            def report(name, entry):
+                event, directory, index, source, events, returncode, wall = entry
+                header = f"[run-hammer-task] theorem {name}; prover {args.prover}"
+                if args.prover == 'vampire-hammer':
+                    header += f"; search {search_seconds}s; vampire memory {memory} MiB"
+                print(header, flush=True)
+                event = finish(name, event, directory, index, source, events, returncode, wall)
+                print(RESULT_PREFIX + json.dumps(event, ensure_ascii=False), flush=True)
+                if event["status"] == "infrastructure_error":
+                    status[0] = 3
+            run_batch(args, config, project, names, module, wrapper_for, parser_dynlib,
+                     search_seconds, case_options, work, report=report)
+            return status[0]
+
+        wrapper = benchmark.bounded_wrapper(work, vampire, memory)
+        source, events = write_case(work, name, wrapper, parser_dynlib, search_seconds, case_options, strategy,
+                                    args.prover, config.get('benchmark_imports'), config.get('comparison', False), module)
+        command, env = lean_command(config, source)
+        header = f"[run-hammer-task] theorem {name}; prover {args.prover}"
+        if args.prover == 'vampire-hammer':
+            header += f"; search {search_seconds}s; vampire memory {memory} MiB"
+        print(header, flush=True)
+        started = time.monotonic()
+        # Vampire keeps live diagnostics; baselines publish only compact results.
+        process = subprocess.Popen(command, cwd=project if env is None else work, env=env,
+                                   stdout=sys.stdout if args.prover == 'vampire-hammer' else subprocess.DEVNULL,
+                                   stderr=subprocess.STDOUT)
+        killed = None
+        wall_timeout = args.wall_timeout if args.wall_timeout is not None else config.get('process_wall_seconds')
+        proof_timeout = args.proof_timeout if args.proof_timeout is not None else config.get('proof_timeout_seconds')
+        try:
+            if proof_timeout is None:
+                returncode = process.wait(timeout=wall_timeout)
+            else:
+                returncode, killed = wait_for_lean(process, events, wall_timeout, proof_timeout, started=started)
+        except subprocess.TimeoutExpired:
+            kill_tree(process)
+            returncode, killed = process.returncode, 'timeout'
+        except BaseException:
+            kill_tree(process)
+            raise
+        wall = time.monotonic() - started
+
+        recorded = read_events(events)
+        event = classify(name, recorded, returncode)
+        replayed = [row for row in recorded if row.get("event") == "replay_finished"]
+        if replayed:
+            event.setdefault("replay_seconds", replayed[-1].get("replay_seconds"))
+        if killed:
+            event = {"event": "finished", "name": name, "status": killed, "kernel_checked": False,
+                     "seconds": proof_timeout if killed == 'proof_timeout' else None,
+                     "replay_seconds": replayed[-1].get('replay_seconds') if replayed else None,
+                     "error": f"{'proof' if killed == 'proof_timeout' else 'process'} wall timeout of {proof_timeout if killed == 'proof_timeout' else wall_timeout}s"}
+        event = finish(name, event, work, 0, source, events, returncode, wall)
+        print(RESULT_PREFIX + json.dumps(event, ensure_ascii=False), flush=True)
+        return 3 if event["status"] == "infrastructure_error" else 0
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    raise SystemExit(main())

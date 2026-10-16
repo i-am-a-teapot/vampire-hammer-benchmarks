@@ -1,0 +1,65 @@
+# Lean/Lake dependencies and compiled output
+.lake/
+*.olean
+*.ilean
+*.olean.private
+*.olean.server
+*.ir
+*.trace
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+
+# Python environments, caches, and coverage
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Generated benchmark suites, raw runs, and analysis outputs
+artifacts/
+run-data/
+slurm-results/
+hammer-artifacts/
+/results/
+/benchmark-pilot/
+/benchmark-results/
+/comparison-pilot/
+/comparison-results/
+/comparison-full*/
+/lean-auto-style-fo/
+/lean-auto-style-ho/
+/lean-auto-style-suite/
+/lean-auto-style-results/
+/hammer-suite/
+/hammer-results/
+/upstream-auto-benchmark/
+/lean-smt-benchmark/
+
+# Logs and Slurm output
+*.log
+slurm-*.out
+slurm-*.err
+
+# Local credentials and environment overrides
+.aws/
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Editor backups and operating-system files
+*~
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

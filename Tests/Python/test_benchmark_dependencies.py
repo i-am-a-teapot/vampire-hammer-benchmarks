@@ -28,6 +28,8 @@ class DependencyTests(unittest.TestCase):
             self.assertEqual(benchmark.vampire_executable(root), library / '.lake/vampire/build/vampire')
             self.assertEqual(benchmark.package_root('tptp_parser', root), library / 'vendor/tptp_parser')
             self.assertEqual(benchmark.package_root('mathlib', root), root / '.lake/packages/mathlib')
+            with self.assertRaisesRegex(ValueError, 'not recorded'):
+                benchmark.package_root('unknown', root)
 
     def test_export_keeps_runs_failures_and_original_times_separate(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -39,7 +41,7 @@ class DependencyTests(unittest.TestCase):
                 'theorem,run_1_status,run_2_status,run_1_seconds,run_2_seconds\n'
                 'A,true,unknown,0.25,10.0\n'
                 'B,ERROR (replay),true,,0.5\n')
-            subprocess.run([sys.executable, str(ROOT / 'slurmrunner/export-comparison-runs.py'),
+            subprocess.run([sys.executable, str(ROOT / 'scripts/export-comparison-runs.py'),
                             '--source', str(source), '--output', str(root / 'csv')],
                            check=True, capture_output=True)
             with (root / 'csv/benchmark-run-1.csv').open() as stream:

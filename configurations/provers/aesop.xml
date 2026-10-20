@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<prover name="aesop" checkout="aesop">
+  <dependency name="aesop" git="https://github.com/leanprover-community/aesop" commit="355695d523e41d0554926416cba2a2b3544fbbc9"/>
+  <imports><![CDATA[
+import Aesop
+]]></imports>
+  <wrapper><![CDATA[
+fun premises => do
+  let clauses ← premises.mapM fun name => do
+    let ident := mkIdent name
+    `(Aesop.tactic_clause| (add unsafe $ident:ident))
+  let config ← `(Aesop.tactic_clause| (config := {
+    maxRuleApplications := 0, maxRuleApplicationDepth := 0,
+    maxNormIterations := 1000000000, maxSafePrefixRuleApplications := 0 }))
+  let clauses := #[config] ++ clauses
+  `(term| by intros; aesop $[$clauses]*)
+]]></wrapper>
+</prover>

@@ -16,7 +16,7 @@ HERE = Path(__file__).resolve().parent
 
 
 def load(name, path):
-    loader = importlib.machinery.SourceFileLoader(name, str(HERE / path))
+    loader = importlib.machinery.SourceFileLoader(name, str(HERE.parents[1] / ('slurmrunner' if path == 'slurmbench.py' else 'scripts') / path))
     spec = importlib.util.spec_from_loader(name, loader)
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
@@ -27,40 +27,96 @@ preparation = load('prepare_isolated_test', 'prepare-provers.py')
 suite = load('suite_isolated_test', 'make-suite.py')
 runner = load('runner_isolated_test', 'run-hammer-task')
 slurm = load('slurm_isolated_test', 'slurmbench.py')
-relocation = load('relativize_isolated_test', '../scripts/relativize-provers.py')
+BACKENDS = preparation.load_definition(preparation.DEFAULT_DEFINITION)
 
 
 class IsolatedTests(unittest.TestCase):
-    def test_existing_compiled_projects_can_be_made_relative(self):
+    def test_reusable_tasks_and_named_configurations(self):
         with tempfile.TemporaryDirectory() as temporary:
-            core = Path(temporary) / 'original'
-            project = core / 'artifacts/provers/duper'
-            packages = project / '.lake/packages'
-            packages.mkdir(parents=True)
-            mathlib = core / '.lake/packages/mathlib'
-            mathlib.mkdir(parents=True)
-            (packages / 'mathlib').symlink_to(mathlib, target_is_directory=True)
-            (project / 'lakefile.lean').write_text(f'require core from {json.dumps(str(core))}\n')
-            (project / 'lake-manifest.json').write_text(json.dumps({'packages': [
-                {'name': 'core', 'type': 'path', 'dir': str(core)}]}))
-            binary = project / '.lake/build/lib/adapter.so'
-            binary.parent.mkdir(parents=True)
-            binary.write_bytes(b'compiled artifact')
-            registry = project.parent / 'backends.json'
-            registry.write_text(json.dumps({'version': 1, 'backends': {
-                'duper': {'project': str(project), 'shared_dependencies': {
-                    'mathlib': {'project': str(mathlib)}}}}}))
-            relocation.relativize(core)
-            first = registry.read_bytes()
-            relocation.relativize(core)
-            self.assertEqual(first, registry.read_bytes())
-            moved = core.with_name('moved')
-            core.rename(moved)
-            spec = suite.isolated.load_backends(moved / 'artifacts/provers/backends.json')['duper']
-            project = Path(spec['project'])
-            self.assertEqual((project / '.lake/packages/mathlib').resolve(), moved / '.lake/packages/mathlib')
-            self.assertEqual(json.loads((project / 'lake-manifest.json').read_text())['packages'][0]['dir'], '../../..')
-            self.assertEqual((project / '.lake/build/lib/adapter.so').read_bytes(), b'compiled artifact')
+            root = Path(temporary)
+            catalog = root / 'catalog.jsonl'
+            catalog.write_text(''.join(json.dumps({'name': f'M.t{i}', 'module': 'M',
+                'catalog_strategy': 'lean-auto-style'}) + '\n' for i in range(4)))
+            tasks = root / 'cases'
+            with patch.object(sys, 'argv', ['make-suite.py', '--tasks-only',
+                    '--catalog', str(catalog), '--count', '2', '--output', str(tasks)]), \
+                    patch.object(suite.isolated, 'backend_config') as backend:
+                self.assertEqual(suite.main(), 0)
+            backend.assert_not_called()
+            selected = (tasks / 'selection.jsonl').read_text()
+            revision = json.loads((tasks / 'test-suite.json').read_text())['mathlib_commit']
+            registry = preparation.prepare(root / 'provers', ['duper'])
+            definition = root / 'experiment.xml'
+            definition.write_text('''<benchmark timelimit="90 s">
+              <tasks><option name="--test-suite">cases</option></tasks>
+              <option name="--case-option">foreign.option=true</option>
+              <rundefinition name="baseline"><option name="--prover">duper</option></rundefinition>
+              <rundefinition name="tuned">
+                <option name="--prover">duper</option>
+                <option name="--case-option">maxSaturationIteration=42</option>
+                <option name="--search-seconds">5</option>
+              </rundefinition>
+            </benchmark>''')
+            def configured(name, spec, args, namespace):
+                return {'project': spec['project'], 'provers': [name], 'lean_version': 'same',
+                    'mathlib_commit': revision, 'backend_source_hashes': {'lakefile.lean': 'hash'},
+                    'case_options': ['maxSaturationIteration=100'],
+                    'supported_options': ['maxSaturationIteration']}
+            output = root / 'suite'
+            with patch.object(suite.isolated, 'backend_config', side_effect=configured) as backend, \
+                    patch.object(suite, 'catalog_rows', side_effect=AssertionError('catalog regenerated')), \
+                    patch.object(sys, 'argv', ['make-suite.py', '--definition', str(definition),
+                        '--backends', str(registry), '--format', 'slurm', '--timelimit', '120 s', '--output', str(output)]):
+                self.assertEqual(suite.main(), 0)
+            self.assertEqual(backend.call_count, 1)
+            self.assertEqual((output / 'selection.jsonl').read_text(), selected)
+            baseline = json.loads((output / 'baseline-config.json').read_text())
+            tuned = json.loads((output / 'tuned-config.json').read_text())
+            self.assertEqual(baseline['case_options'], ['maxSaturationIteration=100'])
+            self.assertEqual(tuned['case_options'], ['maxSaturationIteration=100', 'maxSaturationIteration=42'])
+            self.assertEqual(tuned['omitted_case_options'], ['foreign.option=true'])
+            self.assertEqual(tuned['process_wall_seconds'], 120)
+            parsed = slurm.parse_xml(output / 'vampire-hammer.xml')
+            self.assertEqual(len(parsed['jobs']), 4)
+            self.assertEqual({slurm.comparison_label(j) for j in parsed['jobs']}, {'baseline', 'tuned'})
+            self.assertEqual(len(slurm.batches(parsed, 16)), 2)
+            self.assertTrue(all(j['args'].count('--config') == 1 for j in parsed['jobs']))
+            self.assertTrue(all('--case-option' not in j['args'] for j in parsed['jobs']))
+
+    def test_definition_rejects_duplicate_names_and_legacy_cli_options(self):
+        for option in ('--strategy', '--comparison', '--corpus'):
+            with self.subTest(option=option), patch.object(sys, 'argv',
+                    ['make-suite.py', '--tasks-only', '--output', '/unused', option]), \
+                    patch('sys.stderr'):
+                with self.assertRaises(SystemExit) as error:
+                    suite.main()
+                self.assertEqual(error.exception.code, 2)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            definition = root / 'experiment.xml'
+            for runs in ('', '<rundefinition name="suite"><option name="--prover">duper</option></rundefinition>',
+                    '<rundefinition name="same"><option name="--prover">duper</option></rundefinition>' * 2):
+                definition.write_text('<benchmark>' + runs + '</benchmark>')
+                with patch.object(sys, 'argv', ['make-suite.py', '--definition', str(definition),
+                        '--output', str(root / 'out')]), patch('sys.stderr'):
+                    with self.assertRaises(SystemExit) as error:
+                        suite.main()
+                    self.assertEqual(error.exception.code, 2)
+                self.assertFalse((root / 'out').exists())
+
+    def test_comparison_keeps_variants_of_same_prover_separate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            completed = [({'input': 'T', 'args': ['--prover', 'duper', '--run-label', label,
+                '--search-seconds', '10']}, {'status': status}, None)
+                for label, status in [('baseline', 'true'), ('tuned', 'unknown')]]
+            slurm.comparison_diagnostics(root, completed, {'baseline', 'tuned'})
+            report = json.loads((root / 'comparison-search10.json').read_text())
+            self.assertEqual(report['proved'], {'baseline': 1, 'tuned': 0})
+            self.assertEqual(report['common_eligible'], 1)
+            slurm.comparison_diagnostics(root, completed[:1], {'baseline', 'tuned'})
+            report = json.loads((root / 'comparison-search10.json').read_text())
+            self.assertEqual(report['common_completed'], 0)
 
     def test_prepared_paths_survive_moving_the_checkout(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -71,9 +127,9 @@ class IsolatedTests(unittest.TestCase):
             (core / 'lean-toolchain').write_text('leanprover/lean4:v4.34.1\n')
             (core / 'lake-manifest.json').write_text(json.dumps({'packages': [
                 {'name': 'mathlib', 'type': 'git', 'rev': 'pin', 'url': 'https://example.com/mathlib'}]}))
-            fixture = core / 'slurmrunner/tests/ComparisonBenchmarkTests.lean'
+            fixture = core / 'Tests/Frontend/ComparisonBenchmarkTests.lean'
             fixture.parent.mkdir(parents=True)
-            fixture.write_text((HERE / 'tests/ComparisonBenchmarkTests.lean').read_text())
+            fixture.write_text((HERE.parent / 'Frontend/ComparisonBenchmarkTests.lean').read_text())
             with patch.object(preparation, 'PROJECT', core):
                 registry = preparation.prepare(core / 'artifacts/provers', ['duper'])
             raw = json.loads(registry.read_text())['backends']['duper']
@@ -101,7 +157,7 @@ class IsolatedTests(unittest.TestCase):
             scratch = base / 'scratch'
             scratch.mkdir()
             for path in (mathlib / 'Mathlib.olean', mathlib / 'libMathlib.so',
-                         core / 'slurmrunner/run-hammer-task', toolchain / 'bin/lean'):
+                         core / 'scripts/run-hammer-task', toolchain / 'bin/lean'):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(path.name)
             jobs = []
@@ -120,7 +176,7 @@ class IsolatedTests(unittest.TestCase):
                 path.write_text(json.dumps(config))
                 jobs.append({'args': ['--config', str(path)]})
             config = {'tool': 'hammer_bench.tool_info', 'jobs': jobs, 'workdir': str(base),
-                      'executable': str(core / 'slurmrunner/run-hammer-task')}
+                      'executable': str(core / 'scripts/run-hammer-task')}
             staged, directory = slurm.stage_hammer(config, scratch)
             self.assertEqual(len(list(directory.rglob('Mathlib.olean'))), 1)
             configs = [json.loads(Path(job['args'][1]).read_text()) for job in staged['jobs']]
@@ -137,13 +193,14 @@ class IsolatedTests(unittest.TestCase):
     def test_projects_do_not_force_other_provers_or_their_auto_versions(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
-            path = preparation.prepare(directory, list(preparation.BACKENDS))
+            path = preparation.prepare(directory, list(BACKENDS))
             registry = suite.isolated.load_backends(path)
-            self.assertEqual(set(registry), set(preparation.BACKENDS))
+            self.assertEqual(set(registry), set(BACKENDS))
             self.assertNotIn('lean-smt', registry)
-            self.assertTrue(all('cvc5' not in spec['requires'] for spec in preparation.BACKENDS.values()))
+            self.assertTrue(all('cvc5' not in dep['name'] for spec in BACKENDS.values() for dep in spec['dependencies']))
             shared = preparation.shared_dependencies()
             for name in registry:
+                self.assertNotIn('case_options', registry[name])
                 lakefile = (directory / name / 'lakefile.lean').read_text()
                 self.assertEqual(registry[name]['shared_dependencies'], shared)
                 for package, dependency in shared.items():
@@ -199,7 +256,7 @@ class IsolatedTests(unittest.TestCase):
                 suite.isolated.backend_config('simp_all', spec, None, suite.__dict__)
 
     def test_single_and_batched_cases_load_selected_adapter_without_foreign_options(self):
-        for prover in preparation.BACKENDS:
+        for prover in BACKENDS:
             with self.subTest(prover=prover), tempfile.TemporaryDirectory() as temporary:
                 source, _ = runner.write_batch_case(
                     Path(temporary), ['M.first', 'M.second'], 'wrapper', 'parser', 10, '', prover,
@@ -228,7 +285,7 @@ class IsolatedTests(unittest.TestCase):
             output = root / 'suite'
             with patch.object(suite.isolated, 'backend_config', side_effect=configured), \
                     patch.object(sys, 'argv', ['make-suite.py', '--backends', str(registry),
-                                              '--comparison', '--compact', '--catalog', str(catalog),
+                                              '--format', 'slurm', '--catalog', str(catalog),
                                               '--output', str(output)]):
                 self.assertEqual(suite.main(), 0)
             manifest = slurm.parse_xml(output / 'vampire-hammer.xml')
@@ -258,7 +315,7 @@ class IsolatedTests(unittest.TestCase):
         with patch.dict(os.environ, {'LEAN_PATH': '/foreign/auto', 'LEAN_SRC_PATH': '/foreign/source'}):
             command, environment = runner.lean_command(
                 {'lean': '/selected/lean', 'isolated_backend': True,
-                 'lean_env': {'LEAN_PATH': '/selected/modules'}}, Path('/case.lean'))
+                 'lean_env': {'LEAN_PATH': '/selected/modules'}, 'lean_args': []}, Path('/case.lean'))
         self.assertIn('/selected/lean', command)
         self.assertEqual(environment['LEAN_PATH'], '/selected/modules')
         self.assertNotIn('LEAN_SRC_PATH', environment)
@@ -269,7 +326,9 @@ class IsolatedTests(unittest.TestCase):
             source = root / 'Prover.lean'
             source.write_text('original')
             config = {'isolated_backend': True, 'project': str(root),
-                      'backend_source_hashes': {'Prover.lean': hashlib.sha256(source.read_bytes()).hexdigest()}}
+                      'lean': '/lean', 'lean_args': [], 'lean_env': {}, 'provers': ['duper'],
+                      'supported_options': [], 'benchmark_imports': 'import Benchmark.Prover\n',
+                      'adapter_module': 'Benchmark.Prover', 'backend_source_hashes': {'Prover.lean': hashlib.sha256(source.read_bytes()).hexdigest()}}
             runner.validate_isolated_config(config)
             source.write_text('changed')
             with self.assertRaisesRegex(ValueError, 'sources changed'):

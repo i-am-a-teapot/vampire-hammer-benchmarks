@@ -10,8 +10,8 @@ run_elab do
   -- together into this shared-core regression.
   for prover in #["simp_all", "grind"] do
     let options := (← getOptions).set `maxHeartbeats (0 : Nat)
-    let options := options.set `vampire.benchmarkProver prover
-    let options := options.setBool `vampire.benchmarkComparison true
+    let options := options.set `benchmark.prover prover
+    let options := options.setBool `benchmark.comparison true
     for (target, expected) in #[(`ComparisonBenchmarkFixture.target, "proved"),
                                 (`ComparisonBenchmarkFixture.excluded, "excluded")] do
       let path := directory / s!"{prover}-{target}.jsonl"

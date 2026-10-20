@@ -70,6 +70,9 @@ def read_results(path, budget):
             examples['theorem_mismatch'].append(dict(task_theorem=name, reported_theorem=reported,
                                                     status=cols.get('status')))
         current = cols.get('prover')
+        options = shlex.split(elem.get('options', ''))
+        if current and '--run-label' in options:
+            current = options[options.index('--run-label') + 1]
         if not current or (prover is not None and current != prover):
             raise ValueError(f'{path}: missing or inconsistent prover')
         prover = current

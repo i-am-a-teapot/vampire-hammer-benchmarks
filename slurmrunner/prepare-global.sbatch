@@ -44,8 +44,8 @@ trap 'status=$?; printf "Preparation failed (exit %s). Files: %s\n" "$status" "$
 lake update
 lake exe cache get
 lake build
-python3 slurmrunner/prepare-provers.py --output "$output/provers" --build
-python3 slurmrunner/make-suite.py --backends "$output/provers/backends.json" \
-  --comparison --compact --output "$output/suite"
+python3 scripts/prepare-provers.py --definition configurations/provers.xml --output "$output/provers" --build
+python3 scripts/make-suite.py --backends "$output/provers/backends.json" \
+  --definition configurations/normal.xml --format slurm --output "$output/suite"
 
 printf 'Full benchmark suite ready: %s\n' "$output/suite/vampire-hammer.xml"

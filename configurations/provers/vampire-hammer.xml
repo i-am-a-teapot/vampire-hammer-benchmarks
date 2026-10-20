@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<prover name="vampire-hammer" checkout="vampire-hammer" artifacts="vampire">
+  <dependency name="vampire_hammer" git="https://github.com/vprover/vampire-hammer" commit="4c50a21de3e46e153a266322b0fff0db0f5270c7"/>
+  <imports><![CDATA[
+import VampireHammer
+]]></imports>
+  <declarations><![CDATA[
+initialize benchmarkProofModes.set VampireHammer.Replay.reconstructionModes
+]]></declarations>
+  <wrapper><![CDATA[
+fun premises => do
+  let terms : Array Term := premises.map fun name => ⟨mkIdent name⟩
+  let hints ← terms.mapM fun term => `(Auto.hintelem| $term:term)
+  let hints := #[(← `(Auto.hintelem| *))] ++ hints
+  `(term| by intros; vampire [$[$hints],*])
+]]></wrapper>
+</prover>

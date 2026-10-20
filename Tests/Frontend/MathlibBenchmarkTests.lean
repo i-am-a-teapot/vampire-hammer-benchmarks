@@ -37,7 +37,7 @@ run_elab do
   IO.FS.createDirAll directory
   let source := System.FilePath.mk "Tests/Frontend/BenchmarkReplayFixture.lean"
   let options := (← getOptions).set `maxHeartbeats (65536 : Nat)
-    |>.set `vampire.benchmarkProver "rfl"
+    |>.set `benchmark.prover "rfl"
   for (target, expected) in #[(`BenchmarkReplayFixture.target, "proved"),
                               (`BenchmarkReplayFixture.excluded, "excluded")] do
     let path := directory / s!"{target}.jsonl"

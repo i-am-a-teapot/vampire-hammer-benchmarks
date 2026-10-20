@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<prover name="grind" checkout="grind">
+  <imports><![CDATA[
+]]></imports>
+  <wrapper><![CDATA[
+fun premises => do
+  let terms : Array Term := premises.map fun name => ⟨mkIdent name⟩
+  `(term| by intros; grind [$[$terms:term],*])
+]]></wrapper>
+</prover>

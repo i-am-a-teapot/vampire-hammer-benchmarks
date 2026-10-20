@@ -21,18 +21,6 @@ class BenchmarkTests(unittest.TestCase):
         self.assertLessEqual(max(counts) - min(counts), 1)
         self.assertEqual(len({row["name"] for row in selected}), 8)
 
-    def test_focused_selection_keeps_original_ids(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            corpus = Path(temporary)
-            rows = [{"id": 42, "name": "A"}, {"id": 105, "name": "B"}]
-            (corpus / "lemmas.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
-            names = corpus / "names.txt"
-            names.write_text("B\nB\n")
-            self.assertEqual(benchmark.select_from_corpus(corpus, names, 5000), [rows[1]])
-            names.write_text("missing\n")
-            with self.assertRaises(ValueError):
-                benchmark.select_from_corpus(corpus, names, 5000)
-
     def test_search_budget_is_scoped_to_the_benchmark_case(self):
         source = benchmark.case_command({"id": 42, "name": "A"}, Path("run"), Path("events"), 20)
         self.assertTrue(source.startswith('set_option vampire.timeLimit 20 in\n'))

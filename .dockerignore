@@ -16,5 +16,9 @@
 !Tests/**
 !docker/
 !docker/**
+!configurations/
+!configurations/**
+!docs/
+!docs/**
 **/__pycache__/**
 **/*.pyc

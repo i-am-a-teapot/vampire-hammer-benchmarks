@@ -18,7 +18,7 @@ COMPARISON_IMPORTS = "import Mathlib\nimport VampireHammerBenchmark.Comparison\n
 
 
 def load(name, filename):
-    loader = importlib.machinery.SourceFileLoader(name, str(HERE / filename))
+    loader = importlib.machinery.SourceFileLoader(name, str(HERE.parents[1] / ('slurmrunner' if filename == 'slurmbench.py' else 'scripts') / filename))
     spec = importlib.util.spec_from_loader(name, loader)
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
@@ -31,6 +31,29 @@ suite = load("make_suite", "make-suite.py")
 
 
 class RepositoryTests(unittest.TestCase):
+
+    def test_benchexec_export_uses_standard_xml_and_quotes_task_filenames(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            rows = [{'id': 0, 'name': "List.antidiagonal'", 'module': 'Mathlib.Test'}]
+            shards = suite.write_tasks(rows, output, 1000)
+            args = types.SimpleNamespace(case_option=[], keep_artifacts=True,
+                backend_configs={'duper': output / 'duper-config.json'}, compact=False,
+                shard_size=1000, search_seconds=[10], timelimit='600 s', memlimit='8 GB',
+                cpu_cores=1, hardtimelimit=None, walltimelimit='660 s')
+            xml = output / 'benchmark.xml'
+            xml.write_text(suite.benchmark_xml(args, output / 'suite-config.json', shards))
+            root = slurmbench.ET.parse(xml).getroot()
+            self.assertNotIn('command', root.attrib)
+            self.assertEqual(root[-1].tag, 'columns')
+            self.assertEqual(root.find('tasks/include').text, 'tasks/0000/*.yml')
+            task = next(output.rglob('*.yml'))
+            input_line = next(line for line in task.read_text().splitlines() if line.startswith('input_files:'))
+            filename = json.loads(input_line.partition(':')[2])
+            self.assertEqual((task.parent / filename).read_text(), "List.antidiagonal'\nMathlib.Test\n")
+            parsed = slurmbench.parse_xml(xml)
+            self.assertEqual(Path(parsed['executable']), suite.TOOL_PROJECT / 'scripts/run-hammer-task')
+            self.assertEqual(len(parsed['jobs']), 1)
 
     def test_compact_tasks_roundtrip_without_per_theorem_files(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -80,6 +103,8 @@ class RepositoryTests(unittest.TestCase):
     def test_source_snapshot_provenance_works_without_git(self):
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)
+            (project / 'lake-manifest.json').write_text(json.dumps({'packages': [
+                {'name': 'vampire_hammer', 'type': 'path', 'dir': '.'}]}))
             (project / '.benchmark-source.json').write_text(json.dumps({'revision': 'abcde123456789', 'dirty': [' M source']}))
             with patch.object(suite, 'PROJECT', project), patch.object(suite, 'output_of') as git:
                 self.assertEqual(suite.hammer_revision(), 'abcde1234567-dirty-snapshot')
@@ -166,7 +191,7 @@ class RepositoryTests(unittest.TestCase):
                                          'Mathlib.Data.Nat.Basic')
             text = source.read_text()
             self.assertIn('hammer_mathlib_try_with_premises_in_module', text)
-            self.assertIn('set_option vampire.benchmarkProver "lean-auto-duper"', text)
+            self.assertIn('set_option benchmark.prover "lean-auto-duper"', text)
             self.assertIn('set_option synthInstance.maxHeartbeats 0\n', text)
             for option in ('executable', 'tptpParserDynlib', 'timeLimit', 'diagnosticCase', 'outputPath', 'profileLive'):
                 self.assertNotIn('set_option vampire.' + option, text)
@@ -220,14 +245,11 @@ class RepositoryTests(unittest.TestCase):
             self.assertEqual(command[:2], ["lake", "-R"])
 
 
-    def test_runner_fallback_uses_benchmark_package(self):
-        command, env = runner.lean_command({}, Path("case.lean"))
-        self.assertIn("lake", command)
-        self.assertIn("lean", command)
-        # `lake lean` loads the native libraries; `lake env lean` would not.
-        self.assertNotIn("env", command)
-        self.assertEqual(command[command.index("lean") + 1], "case.lean")
-        self.assertIsNone(env)
+    def test_runner_rejects_unconfigured_prover_builds(self):
+        with self.assertRaisesRegex(ValueError, 'isolated prover config'):
+            runner.validate_isolated_config({})
+        with self.assertRaisesRegex(ValueError, 'regenerate the suite'):
+            runner.validate_isolated_config({'isolated_backend': True})
 
     def test_runner_passes_recorded_native_flags(self):
         config = {"lean": "/toolchain/bin/lean", "lean_env": {},
@@ -282,12 +304,12 @@ class RepositoryTests(unittest.TestCase):
         with patch.object(suite.subprocess, 'run', return_value=result), self.assertRaises(SystemExit):
             suite.native_lean_args()
 
-    def test_duper_strategy_rejects_unfiltered_catalog(self):
+    def test_generator_rejects_legacy_catalog(self):
         with tempfile.TemporaryDirectory() as temporary:
             catalog = Path(temporary) / "catalog.jsonl"
             catalog.write_text(json.dumps({"name": "Nat.add_comm", "module": "Mathlib.Data.Nat.Basic"}) + "\n")
             args = types.SimpleNamespace(catalog=catalog, strategy="lean-auto-style")
-            with self.assertRaisesRegex(SystemExit, "requires a catalog generated with that strategy"):
+            with self.assertRaisesRegex(ValueError, "lean-auto-style testcases"):
                 suite.catalog_rows(args, Path(temporary))
 
 # Minimal stand-ins so the tool-info module imports without BenchExec installed.
@@ -300,12 +322,21 @@ template.BaseTool2 = object
 benchexec.result, benchexec.tools, tools.template = result, tools, template
 sys.modules.update({"benchexec": benchexec, "benchexec.result": result,
                     "benchexec.tools": tools, "benchexec.tools.template": template})
-sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parents[1] / 'scripts'))
 from hammer_bench import tool_info  # noqa: E402
 
 
 def output(row):
     return ["[run-hammer-task] theorem X; search 20s", "lean output", "HAMMER-RESULT: " + json.dumps(row)]
+
+
+def prover_config(prover='vampire-hammer'):
+    return {'isolated_backend': True, 'project': str(suite.PROJECT),
+            'lean': '/toolchain/bin/lean', 'lean_args': [], 'lean_env': {},
+            'provers': [prover], 'supported_options': ['maxHeartbeats', 'synthInstance.maxHeartbeats'],
+            'benchmark_imports': 'import VampireHammerBenchmark.Mathlib\n',
+            'adapter_module': 'Benchmark.Prover', 'vampire': '/unused/vampire',
+            'tptp_parser_dynlib': '/unused/parser.so'}
 
 
 class RunnerTests(unittest.TestCase):
@@ -321,11 +352,12 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(details['vampire_queries'], 2)
             self.assertEqual(details['query_details'][1]['szs_status'], 'GaveUp')
 
-    def test_legacy_result_with_exported_input_has_unknown_attribution(self):
+    def test_result_without_accepted_proof_route_has_unknown_attribution(self):
         stdout = io.StringIO()
         finished = {'event': 'finished', 'name': 'T', 'status': 'proved', 'seconds': 1.2,
                     'kernel_checked': True}
         with patch.object(sys, 'argv', ['run-hammer-task', '--theorem', 'T']), \
+                patch.object(runner, 'load_config', return_value=prover_config()), \
                 patch.object(sys, 'stdout', stdout), patch.object(runner.subprocess, 'Popen') as popen, \
                 patch.object(runner, 'read_events', return_value=[finished]), \
                 patch.object(runner, 'vampire_details', return_value={'vampire_queries': 1}):
@@ -343,6 +375,7 @@ class RunnerTests(unittest.TestCase):
                             'route_source': 'accepted_proof', 'reconstruction_modes': [] if route == 'direct' else ['fo'],
                             'seconds': 1.2, 'kernel_checked': True}
                 with patch.object(sys, 'argv', ['run-hammer-task', '--theorem', 'T']), \
+                        patch.object(runner, 'load_config', return_value=prover_config()), \
                         patch.object(sys, 'stdout', stdout), patch.object(runner.subprocess, 'Popen') as popen, \
                         patch.object(runner, 'read_events', return_value=[finished]), \
                         patch.object(runner, 'vampire_details', return_value={'vampire_queries': 2}):
@@ -375,6 +408,7 @@ class RunnerTests(unittest.TestCase):
                             'seconds': 1.2, 'kernel_checked': False, 'premises': ['P'], 'axioms': ['A']}
                 with patch.object(sys, 'argv', ['run-hammer-task', '--theorem', 'T', '--prover', prover,
                                                '--keep-artifacts', '--artifacts-dir', str(artifacts)]), \
+                        patch.object(runner, 'load_config', return_value=prover_config(prover)), \
                         patch.object(sys, 'stdout', stdout), \
                         patch.object(runner.subprocess, 'Popen') as popen, \
                         patch.object(runner, 'read_events', return_value=[finished]), \
@@ -633,6 +667,9 @@ class CollectorTests(unittest.TestCase):
         row = collector.parse_log("search20.000042-Foo.bar_baz'.yml.log",
                                   "\n".join(output({"status": "proved", "name": "Foo.bar_baz'"})))
         self.assertEqual((row["id"], row["rundefinition"], row["status"]), (42, "search20", "proved"))
+        row = collector.parse_log("duper.tuned-search10.000042-Foo.yml.log",
+                                  "\n".join(output({"status": "proved", "name": "Foo"})))
+        self.assertEqual(row['rundefinition'], 'duper.tuned-search10')
 
     def test_killed_run_keeps_theorem_name(self):
         row = collector.parse_log("search5.000007-A.b.yml.log",
@@ -708,7 +745,7 @@ class SlurmbenchHammerTests(unittest.TestCase):
                 self.assertTrue({'last-phase', 'error', 'queries', 'category'}.isdisjoint(titles))
             self.assertTrue((out / 'comparison-search10.json').exists())
 
-    def test_result_reading_reports_progress_for_legacy_and_bulk(self):
+    def test_result_reading_reports_progress_for_files_and_bulk(self):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)
             (output / 'logs').mkdir()
@@ -766,14 +803,8 @@ class SlurmbenchHammerTests(unittest.TestCase):
             records = slurmbench.read_results(output, bulk_only=True)
             self.assertEqual(records[0]['status'], 'unknown')
             self.assertEqual(slurmbench.read_run_log(output, records[0]), 'replacement\n')
-            copied = slurmbench.ResultJournal(output, 'packed-legacy')
-            location = records[0]['log_storage']
-            copied.save(dict(records[0]), output / location['path'], location['offset'],
-                        location['length'], location['encoding'])
-            copied.close()
-            self.assertEqual(slurmbench.read_run_log(output, slurmbench.read_results(output, True)[0]), 'replacement\n')
 
-    def test_bulk_execution_and_legacy_packing(self):
+    def test_execution_supports_files_and_bulk_journals(self):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)
             (output / 'logs').mkdir()
@@ -783,23 +814,9 @@ class SlurmbenchHammerTests(unittest.TestCase):
                    'mem_mb': 64, 'cpus': 1}
             cfg['jobs'][0].update(input='000000-fixture.thm', runset='default', taskset='tasks')
             slurmbench.run_one(cfg, 0)
-            before = slurmbench.read_results(output)
-            manifest = output / 'manifest.json'
-            manifest.write_text(json.dumps(cfg))
-            slurmbench.collect(types.SimpleNamespace(manifest=str(manifest), partial=False))
-            xml_path = output / 'fixture.default.results.xml'
-            before_xml = slurmbench.ET.parse(xml_path)
-            slurmbench.pack_results(types.SimpleNamespace(manifest=str(manifest)))
-            slurmbench.collect(types.SimpleNamespace(manifest=str(manifest), partial=False))
-            after_xml = slurmbench.ET.parse(xml_path)
-            self.assertEqual(before_xml.find('run').find('column').attrib,
-                             after_xml.find('run').find('column').attrib)
-            packed = slurmbench.read_results(output, bulk_only=True)
-            self.assertEqual(slurmbench.read_run_log(output, packed[0]), 'hello\n')
-            for key in ('status', 'returncode', 'extracted'):
-                self.assertEqual(packed[0][key], before[0][key])
+            records = slurmbench.read_results(output)
+            self.assertEqual(slurmbench.read_run_log(output, records[0]), 'hello\n')
             self.assertTrue((output / 'logs/000000.json').exists())
-            self.assertEqual(json.loads(manifest.read_text())['result_format'], 'bulk')
             cfg['jobs'].append({'args': ['-c', 'print("bulk")']})
             journal = slurmbench.ResultJournal(output, 'shard-001-rank-000')
             slurmbench.run_one(cfg, 1, journal=journal, local_log=output / 'slot.log')
@@ -983,7 +1000,7 @@ class SlurmbenchHammerTests(unittest.TestCase):
             project, toolchain = base / 'project', base / 'toolchain'
             scratch = base / 'scratch'
             scratch.mkdir()
-            files = [project / 'slurmrunner/run-hammer-task', project / '.lake/build/lib/lean/Hammer.olean',
+            files = [project / 'scripts/run-hammer-task', project / '.lake/build/lib/lean/Hammer.olean',
                      project / 'vampire', project / 'parser.so', toolchain / 'bin/lean',
                      project / 'Mathlib.lean', project / '.lake/build/lib/libhammer.so',
                      toolchain / 'lib/lean/libLake_shared.so']

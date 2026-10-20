@@ -4,7 +4,7 @@ Only stdlib required. Run `python slurmbench.py --help`.
 
 Tool modes (the `tool` attribute of <benchmark>):
   vampire   status and columns as BenchExec's Vampire tool-info module;
-  *hammer*  the Vampire hammer on mathlib (slurmrunner/run-hammer-task, e.g.
+  *hammer*  the Vampire hammer on mathlib (scripts/run-hammer-task, e.g.
             tool="hammer_bench.tool_info"): status as its BenchExec tool-info
             module, plus failure classification and diagnostics columns, and
             `collect` writes summary.json, cases.tsv and per-category theorem lists;
@@ -77,6 +77,8 @@ def parse_xml(path):
     if root.tag != 'benchmark':
         raise ValueError('Expected <benchmark> root')
     exe = root.get('command')
+    if not exe and root.get('tool') == 'hammer_bench.tool_info':
+        exe = str(Path(__file__).resolve().parents[1] / 'scripts/run-hammer-task')
     if not exe:
         raise ValueError('Missing command="/path/to/program" on <benchmark>')
     base = path.parent.resolve()
@@ -203,7 +205,7 @@ def vampire_metrics(text, exitcode, timed_out=False):
             'termination-reasons': reasons}
 
 
-# --- Vampire hammer on mathlib (slurmrunner/run-hammer-task) -------------------
+# --- Vampire hammer on mathlib (scripts/run-hammer-task) -------------------
 
 HAMMER_RESULT = 'HAMMER-RESULT: '
 HAMMER_THEOREM = '[run-hammer-task] theorem '
@@ -233,7 +235,7 @@ def job_prover(job):
 
 
 def hammer_category(row, lean_error=''):
-    """Finer failure category, as scripts/analyze-mathlib-benchmark.py."""
+    """Classify proof, export and infrastructure failures for diagnostics."""
     kind = row.get('failure_kind') or row.get('status')
     message = (row.get('error') or '').lower()
     failure_expression = message.split('this is because', 1)[0]
@@ -275,7 +277,7 @@ def hammer_category(row, lean_error=''):
 
 
 def hammer_phases(lines):
-    """Read phase timings from legacy benchmark logs."""
+    """Read phase timings from prover profiling messages."""
     durations = defaultdict(float)
     open_phases, last = [], None
     for line in lines:
@@ -474,7 +476,7 @@ def hammer_diagnostics(out, runset, runs):
             values += [round(data['walltime'], 3), data.get('cputime'), data.get('memory'), job['input']]
             stream.write('\t'.join('' if v is None else str(v).replace('\t', ' ') for v in [data['idx'], *values]) + '\n')
     for category, items in by_category.items():
-        # Theorem lists can be passed to slurmrunner/make-suite.py --names for a focused rerun.
+        # Theorem lists can be passed to scripts/make-suite.py --names for a focused rerun.
         names = sorted({x.get('theorem') for _, _, x in items if x.get('theorem')})
         (target / 'categories' / f'{re.sub(r"[^A-Za-z0-9_.-]+", "_", str(category))}.txt').write_text(
             ''.join(name + '\n' for name in names))
@@ -669,27 +671,13 @@ class ResultJournal:
         self.records = self.records_path.open('wb')
         self.lock = threading.Lock()
 
-    def save(self, data, logfile, source_offset=0, source_length=None, source_encoding=None):
+    def save(self, data, logfile):
         with self.lock:
             offset = self.log.tell()
-            destination = self.log if source_encoding == 'gzip' else gzip.GzipFile(
-                filename='', mode='wb', fileobj=self.log, compresslevel=1, mtime=0)
-            try:
+            with gzip.GzipFile(filename='', mode='wb', fileobj=self.log,
+                               compresslevel=1, mtime=0) as destination:
                 with Path(logfile).open('rb') as stream:
-                    stream.seek(source_offset)
-                    if source_length is None:
-                        shutil.copyfileobj(stream, destination)
-                    else:
-                        remaining = source_length
-                        while remaining:
-                            chunk = stream.read(min(remaining, 1024 * 1024))
-                            if not chunk:
-                                raise ValueError(f'Truncated log in {logfile}')
-                            destination.write(chunk)
-                            remaining -= len(chunk)
-            finally:
-                if destination is not self.log:
-                    destination.close()
+                    shutil.copyfileobj(stream, destination)
             length = self.log.tell() - offset
             self.log.flush()
             data['log_storage'] = {'path': str(self.log_path.relative_to(self.output)),
@@ -768,35 +756,6 @@ def show_log(ns):
     if ns.idx not in results:
         raise ValueError(f'No completed result for index {ns.idx}')
     print(read_run_log(cfg['output'], results[ns.idx]), end='')
-
-
-def pack_results(ns):
-    """Consolidate an already completed legacy run without deleting originals."""
-    manifest = Path(ns.manifest)
-    cfg = json.loads(manifest.read_text())
-    output = Path(cfg['output'])
-    results = read_results(output, bulk_only=cfg.get('result_format') == 'bulk')
-    missing = [idx for idx in range(len(cfg['jobs'])) if idx not in results]
-    if missing:
-        raise ValueError(f'{len(missing)} runs are incomplete; pack-results requires a completed run')
-    if cfg.get('result_format') == 'bulk':
-        print('Results already use bulk storage.')
-        return
-    journal = ResultJournal(output, 'packed-legacy')
-    try:
-        for idx in range(len(cfg['jobs'])):
-            data = dict(results[idx])
-            location = data.get('log_storage')
-            if location:
-                journal.save(data, output / location['path'], location['offset'], location['length'], location.get('encoding'))
-            else:
-                journal.save(data, output / 'logs' / f'{idx:06d}.log')
-    finally:
-        journal.close()
-    cfg['result_format'] = 'bulk'
-    cfg['packed_legacy_results'] = True
-    save_json(manifest, cfg)
-    print(f'Packed {len(cfg["jobs"])} results. Originals retained; collection now reads journals only.')
 
 
 def run_one(cfg, idx, core=None, journal=None, local_log=None):
@@ -1250,7 +1209,7 @@ def packed_worker(ns):
         # cancelled shard). A batch killed at the deadline has no usable
         # result, so it runs again.
         done = read_results(cfg['output'], bulk_only=cfg.get('result_format') == 'bulk',
-                            wanted=set(indices), prefix=None if cfg.get('packed_legacy_results') else journal_prefix)
+                            wanted=set(indices), prefix=journal_prefix)
         done = usable_results(done)
         indices = [i for i in indices if i not in done]
         groups = [[i for i in group if i not in done] for group in groups]
@@ -1319,7 +1278,7 @@ def submit_packed(ns):
                 'partition': ns.partition,
                 'packed_nodes': ns.nodes, 'packed_cpus_per_node': ns.cpus_per_node,
                 'shards': ns.shards, 'job_ids': [], 'scratch_root': ns.scratch_root,
-                'result_format': getattr(ns, 'result_format', 'bulk'),
+                'result_format': 'bulk',
                 'job_array': ns.job_array, 'array_parallel': ns.array_parallel,
                 'batch_by_module': getattr(ns, 'batch_by_module', 1),
                 'physical_cores': getattr(ns, 'physical_cores', False) or getattr(ns, 'require_no_boost_no_smt', False),
@@ -1420,6 +1379,11 @@ def column(parent, title, value):
     ET.SubElement(parent, 'column', {'title': title, 'value': str(value)})
 
 
+def comparison_label(job):
+    key = '--run-label' if '--run-label' in job['args'] else '--prover'
+    return job['args'][job['args'].index(key) + 1]
+
+
 def comparison_diagnostics(out, completed, expected_provers=None):
     """Paired results on the common completed, eligible theorem set."""
     provers = ('vampire-hammer', 'duper', 'aesop', 'simp_all', 'grind')
@@ -1427,7 +1391,7 @@ def comparison_diagnostics(out, completed, expected_provers=None):
     for job, data, _ in completed:
         if '--prover' not in job['args']:
             continue
-        prover = job['args'][job['args'].index('--prover') + 1]
+        prover = comparison_label(job)
         seconds_arg = job['args'][job['args'].index('--search-seconds') + 1]
         groups[seconds_arg].setdefault(job['input'], {})[prover] = data
     if 'lean-auto-duper' in (expected_provers or ()) or any('lean-auto-duper' in rows for cases in groups.values() for rows in cases.values()):
@@ -1572,7 +1536,7 @@ def collect(ns):
     print(f'Collected {len(completed)}/{len(cfg["jobs"])} runs; missing {len(missing)}.')
     if kind == 'hammer':
         print('Writing comparison diagnostics...', flush=True)
-        comparison_diagnostics(out, completed, {job['args'][job['args'].index('--prover') + 1]
+        comparison_diagnostics(out, completed, {comparison_label(job)
                                               for job in cfg['jobs'] if '--prover' in job['args']})
     if missing:
         print('Missing indices:', ', '.join(map(str, missing[:30])))
@@ -1644,8 +1608,6 @@ def main():
                     help='Replay each defining module once for up to N consecutive theorems of the same '
                          'tactic (lean-auto-style suites with module metadata); results stay per theorem')
     sp.add_argument('--scratch-root', help='Stage hammer checkout and Lean toolchain once per node under this existing directory (e.g. /scratch); requires rsync')
-    sp.add_argument('--result-format', choices=('bulk', 'files'), default='bulk',
-                    help='bulk (default): append node-local execution logs/results to two shared files per node worker; files: legacy per-run output')
     sp.add_argument('--sbatch-arg', action='append')
     sp.set_defaults(func=submit_packed)
     rs = sub.add_parser('resubmit-shard', help='Resubmit a packed shard; runs with usable results are skipped')
@@ -1666,13 +1628,10 @@ def main():
     c.add_argument('manifest')
     c.add_argument('--partial', action='store_true')
     c.set_defaults(func=collect)
-    log = sub.add_parser('show-log', help='Print a run log from bulk or legacy storage')
+    log = sub.add_parser('show-log', help='Print a run log from packed or individual result files')
     log.add_argument('manifest')
     log.add_argument('idx', type=int)
     log.set_defaults(func=show_log)
-    pack = sub.add_parser('pack-results', help='Consolidate a completed legacy run for faster repeated collection; retains originals')
-    pack.add_argument('manifest')
-    pack.set_defaults(func=pack_results)
     ns = p.parse_args()
     try:
         ns.func(ns)

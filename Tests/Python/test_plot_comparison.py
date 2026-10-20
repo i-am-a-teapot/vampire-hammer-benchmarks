@@ -8,7 +8,7 @@ import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 
-spec = importlib.util.spec_from_file_location('plot_comparison', Path(__file__).with_name('plot-comparison.py'))
+spec = importlib.util.spec_from_file_location('plot_comparison', Path(__file__).resolve().parents[2] / 'scripts/plot-comparison.py')
 plot = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = plot
 spec.loader.exec_module(plot)
@@ -37,17 +37,25 @@ class ComparisonTests(unittest.TestCase):
         self.assertEqual(partial['incomplete'], 1)
         self.assertEqual(partial['common_eligible'], 2)
 
-    def read_fixture(self, records):
+    def read_fixture(self, records, run_label=None):
         root = ET.Element('result')
         for name, cols in records:
             run = ET.SubElement(root, 'run', name=f'cases.jsonl#000001-{name}',
-                                options='--prover hammer --theorem ' + __import__('shlex').quote(name))
+                                options='--prover hammer ' +
+                                (f'--run-label {run_label} ' if run_label else '') +
+                                '--theorem ' + __import__('shlex').quote(name))
             for key, value in dict(prover='hammer', **cols).items():
                 ET.SubElement(run, 'column', title=key, value=value)
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / 'results.xml'
             ET.ElementTree(root).write(path)
             return plot.read_results(path, 10)
+
+    def test_named_configuration_identifies_curve_separately_from_prover(self):
+        name, rows, _ = self.read_fixture([
+            ('T', {'theorem': 'T', 'status': 'unknown', 'outcome': 'timeout'})], run_label='hammer-tuned')
+        self.assertEqual(name, 'hammer-tuned')
+        self.assertEqual(set(rows), {'T'})
 
     def test_success_integrity_and_missing_metadata(self):
         _, rows, audit = self.read_fixture([

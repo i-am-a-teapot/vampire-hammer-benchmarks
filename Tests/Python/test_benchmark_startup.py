@@ -10,7 +10,7 @@ import unittest
 HERE = Path(__file__).resolve().parent
 
 def load(name, file):
-    loader = importlib.machinery.SourceFileLoader(name, str(HERE / file))
+    loader = importlib.machinery.SourceFileLoader(name, str(HERE.parents[1] / ('slurmrunner' if file == 'slurmbench.py' else 'scripts') / file))
     spec = importlib.util.spec_from_loader(name, loader)
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
@@ -67,7 +67,7 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(slurm.hammer_metrics(sections['A.two'], 0)['attempt-events'], [second])
 
     def test_batch_harness_overrides_diagnostic_case_per_target(self):
-        source = (HERE.parent / 'VampireHammerBenchmark/Mathlib.lean').read_text()
+        source = (HERE.parents[1] / 'VampireHammerBenchmark/Mathlib.lean').read_text()
         self.assertIn('options.set `vampire.diagnosticCase target.toString', source)
 
 
@@ -85,13 +85,13 @@ class StartupTests(unittest.TestCase):
         self.assertIn('import Mathlib.Data.Int.Order.Basic\n', text)
         self.assertIn('import VampireHammerBenchmark.Comparison\n', text)
         self.assertIn('hammer_mathlib_try_with_premises_in_module "Int.example" module "Mathlib.Data.Int.Order.Basic" recording ', text)
-        self.assertIn('set_option vampire.benchmarkComparison true', text)
+        self.assertIn('set_option benchmark.comparison true', text)
 
-    def test_old_tasks_and_statement_strategy_keep_their_environment(self):
+    def test_missing_module_uses_proof_premises_and_legacy_strategy_is_rejected(self):
         self.assertIn('import Mathlib\n', self.case(module=None))
         self.assertIn('hammer_mathlib_try_with_premises "Int.example"', self.case(module=None))
-        self.assertIn('import Mathlib\n', self.case(strategy='hammer'))
-        self.assertIn('hammer_mathlib_try "Int.example"', self.case(strategy='hammer'))
+        with self.assertRaisesRegex(ValueError, 'only lean-auto-style'):
+            self.case(strategy='hammer')
 
     def test_module_metadata_cannot_inject_lean_commands(self):
         with self.assertRaises(ValueError):

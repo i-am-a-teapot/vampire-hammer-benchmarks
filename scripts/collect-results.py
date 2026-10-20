@@ -18,14 +18,14 @@ import sys
 import zipfile
 import importlib.util
 
-_spec = importlib.util.spec_from_file_location('slurm_results', Path(__file__).with_name('slurmbench.py'))
+_spec = importlib.util.spec_from_file_location('slurm_results', Path(__file__).resolve().parents[1] / 'slurmrunner/slurmbench.py')
 slurm = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(slurm)
 
 RESULT_PREFIX = "HAMMER-RESULT: "
 THEOREM_PREFIX = "[run-hammer-task] theorem "
 # BenchExec names logs <rundefinition>.<task file>.log; task files start with a six-digit id.
-LOG_NAME = re.compile(r"^(?:.*?\.)?(?P<run>[^.]+)\.(?P<id>\d{6})-[^/]*\.log$")
+LOG_NAME = re.compile(r"^(?P<run>.+)\.(?P<id>\d{6})-[^/]*\.log$")
 
 
 def log_texts(paths):
@@ -74,7 +74,7 @@ def parse_log(name, text):
 
 
 def failure_details(metrics):
-    """Use the same diagnostics for legacy logs and Slurm result journals."""
+    """Use the same diagnostics for BenchExec logs and Slurm result journals."""
     if metrics.get('prover', 'vampire-hammer') != 'vampire-hammer':
         return {}
     details = {'lean_errors': metrics.get('lean-errors', []),
@@ -95,7 +95,7 @@ def main():
     args = parser.parse_args()
 
     runs = defaultdict(dict)
-    legacy_paths = []
+    benchexec_paths = []
     for path in args.paths:
         manifest = path / 'manifest.json' if path.is_dir() else path
         if manifest.name == 'manifest.json' and manifest.is_file():
@@ -129,8 +129,8 @@ def main():
                     row.update(id=theorem_id, rundefinition=job['runset'], log=data.get('log_storage') or f'logs/{idx:06d}.log')
                 runs[job['runset']][theorem_id] = row
         else:
-            legacy_paths.append(path)
-    for name, text in log_texts(legacy_paths):
+            benchexec_paths.append(path)
+    for name, text in log_texts(benchexec_paths):
         row = parse_log(name, text)
         if row is not None:
             # A rerun of the same task supersedes an earlier (e.g. killed) one.

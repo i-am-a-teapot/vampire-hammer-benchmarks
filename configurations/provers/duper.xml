@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<prover name="duper" checkout="duper">
+  <dependency name="Duper" git="https://github.com/leanprover-community/duper" commit="9e09cd05fd541d6cef4c485882b7978d32c7e0a3"/>
+  <imports><![CDATA[
+import Duper
+]]></imports>
+  <wrapper><![CDATA[
+fun premises => do
+  let terms : Array Term := premises.map fun name => ⟨mkIdent name⟩
+  `(term| by intros; duper [*, $[$terms],*])
+]]></wrapper>
+</prover>

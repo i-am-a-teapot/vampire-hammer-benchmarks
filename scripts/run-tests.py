@@ -23,7 +23,7 @@ def main():
     passed = True
     if args.suite in ('python', 'all') and not args.files:
         tests = unittest.TestSuite()
-        for relative in ('Tests/Python', 'slurmrunner'):
+        for relative in ('Tests/Python',):
             directory = str(PROJECT / relative)
             tests.addTests(unittest.TestLoader().discover(directory, top_level_dir=directory))
         if args.list:
@@ -32,7 +32,7 @@ def main():
             passed = unittest.TextTestRunner(verbosity=1).run(tests).wasSuccessful()
     if args.suite in ('lean', 'all') or args.files:
         files = args.files or [Path('Tests/Frontend/MathlibBenchmarkTests.lean'),
-                              Path('slurmrunner/tests/ComparisonBenchmarkTests.lean')]
+                              Path('Tests/Frontend/ComparisonBenchmarkTests.lean')]
         for path in files:
             if args.list:
                 print(path)

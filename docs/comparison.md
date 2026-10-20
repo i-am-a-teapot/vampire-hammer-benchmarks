@@ -3,9 +3,10 @@
 The supported comparison workflow uses one Lake project per prover:
 
 ```sh
-python3 slurmrunner/prepare-provers.py --output artifacts/provers --build
-python3 slurmrunner/make-suite.py --backends artifacts/provers/backends.json \
-  --comparison --compact --count 100 --output ../comparison-isolated
+python3 scripts/prepare-provers.py --output artifacts/provers --build
+python3 scripts/make-suite.py --definition configurations/normal.xml \
+  --backends artifacts/provers/backends.json \
+  --format slurm --count 100 --output ../comparison-isolated
 ```
 
 Repeat `--prover NAME` to select projects when preparing or generating a suite.
@@ -17,7 +18,7 @@ can differ; targets already imported by a tactic are excluded uniformly.
 
 # Tactic comparisons
 
-`make-suite.py --backends REGISTRY --comparison` compares the selected backends.
+`make-suite.py --backends REGISTRY` compares the selected backends.
 Each tactic receives the same direct theorem dependencies and local hypotheses in the environment before the target
 declaration. The original proof supplies premise names and eligibility only.
 
@@ -42,10 +43,11 @@ From the repository root:
 lake -R update
 lake -R exe cache get
 lake -R build VampireHammerBenchmark
-python3 slurmrunner/prepare-provers.py --output artifacts/provers --build
+python3 scripts/prepare-provers.py --output artifacts/provers --build
 
-python3 slurmrunner/make-suite.py --backends artifacts/provers/backends.json \
-  --comparison --compact --count 12 \
+python3 scripts/make-suite.py --definition configurations/normal.xml \
+  --backends artifacts/provers/backends.json \
+  --format slurm --count 12 \
   --search-seconds 10 --success-seconds 10 --output ../comparison-pilot
 python3 slurmrunner/slurmbench.py submit-packed ../comparison-pilot/vampire-hammer.xml \
   -p PARTITION --nodes 1 --cpus-per-node 4 --mem 32G --shards 1 \
@@ -88,7 +90,7 @@ To audit which export routes occur in accepted vampire-hammer proofs, including
 evidence of decomposition and branch searches, run:
 
 ```sh
-python3 slurmrunner/analyze-routes.py \
+python3 scripts/analyze-routes.py \
   ~/comparison-full-no-bundled-results ~/comparison-full-no-bundled-results2 \
   --output artifacts/comparison-full-no-bundled-average/routes
 ```
@@ -103,7 +105,7 @@ and cannot identify splits whose branches all close directly in Lean. The
 report preserves these limitations rather than attributing all mixed proofs or
 all entries into the decomposition fallback to successful splitting.
 
-`slurmrunner/analyze-empty-cases.py` accepts the same directories and `--output`
+`scripts/analyze-empty-cases.py` accepts the same directories and `--output`
 argument to audit empty-domain recovery, including failed benchmark cases. It
 produces per-case CSVs, residual-branch event traces and a JSON summary. An
 `empty_branch` event means simplification left an obligation; external calls
@@ -115,7 +117,7 @@ ambiguous when counting completed branches.
 With Python 3.10+ and Matplotlib installed, run from the repository root:
 
 ```sh
-python3 slurmrunner/plot-comparison.py ~/comparison-full-no-bundled-results \
+python3 scripts/plot-comparison.py ~/comparison-full-no-bundled-results \
   --output artifacts/comparison-full-no-bundled
 ```
 
@@ -153,7 +155,7 @@ the result directory contains multiple search budgets.
 To average independent repetitions, pass their result directories together:
 
 ```sh
-python3 slurmrunner/plot-comparison.py \
+python3 scripts/plot-comparison.py \
   ~/comparison-full-no-bundled-results ~/comparison-full-no-bundled-results2 \
   --output artifacts/comparison-full-no-bundled-average
 ```

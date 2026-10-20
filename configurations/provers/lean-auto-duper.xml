@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<prover name="lean-auto-duper" checkout="lean-auto-duper">
+  <dependency name="Duper" git="https://github.com/leanprover-community/duper" commit="9e09cd05fd541d6cef4c485882b7978d32c7e0a3"/>
+  <dependency name="auto" git="https://github.com/leanprover-community/lean-auto" commit="6b2774cde4d1cb7ac4d48ac61c34e950e0588d69"/>
+  <imports><![CDATA[
+import Duper
+import Auto.Tactic
+]]></imports>
+  <declarations><![CDATA[
+open Lean Auto in
+@[rebind Auto.Native.solverFunc]
+def Auto.duperRaw (lemmas : Array Lemma) (_inhs : Array Lemma) : MetaM Expr := do
+  let formulas : Array (Expr × Expr × Array Name × Bool) ← lemmas.mapM
+    (fun ⟨⟨proof, ty, _⟩, _⟩ => do return (ty, ← Meta.mkAppM ``eq_true #[proof], #[], true))
+  Duper.runDuper formulas.toList [] 0
+]]></declarations>
+  <wrapper><![CDATA[
+fun premises => do
+  let terms : Array Term := premises.map fun name => ⟨mkIdent name⟩
+  let hints ← terms.mapM fun term => `(Auto.hintelem| $term:term)
+  let hints := #[(← `(Auto.hintelem| *))] ++ hints
+  `(term| by
+    intros
+    set_option auto.native true in
+      set_option auto.smt false in
+        set_option auto.tptp false in
+          auto [$[$hints],*])
+]]></wrapper>
+</prover>

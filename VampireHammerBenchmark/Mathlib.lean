@@ -3,19 +3,14 @@ import Lean.Util.CollectAxioms
 import Lean.DeclarationRange
 
 /-! Shared benchmark commands with no prover dependency.
-The default strategy supplies only the statement. The separate proof-premise
-strategy inspects the original proof only to extract theorem names, as in the
-Lean-auto/Duper evaluation; it never supplies the original proof term. -/
+Evaluation inspects the original proof only to extract theorem names, as in
+the Lean-auto/Duper evaluation; it never supplies the original proof term. -/
 
 namespace VampireHammer.Benchmark
 
 open Lean Meta Elab Command
 
-register_option vampire.benchmarkProver : String := {
-  defValue := "simp_all"
-  descr := "Benchmark tactic: vampire-hammer, duper, aesop, simp_all or grind"
-}
-register_option vampire.benchmarkComparison : Bool := {
+register_option benchmark.comparison : Bool := {
   defValue := false
   descr := "Use comparison timing and heartbeat policy during source replay"
 }
@@ -26,13 +21,12 @@ register_option benchmark.adapterModule : String := {
 }
 
 register_option benchmark.prover : String := {
-  defValue := ""
-  descr := "Selected prover (empty uses the legacy vampire.benchmarkProver option)"
+  defValue := "simp_all"
+  descr := "Prover registered by the selected isolated adapter"
 }
 
 def selectedProver (options : Options) : String :=
-  let prover := benchmark.prover.get options
-  if prover.isEmpty then vampire.benchmarkProver.get options else prover
+  benchmark.prover.get options
 
 initialize benchmarkTactics : IO.Ref (Std.HashMap String (Array Name → TermElabM Term)) ← IO.mkRef {}
 
@@ -52,7 +46,7 @@ private def appendEvent (path : String) (event : Json) : IO Unit :=
     stream.putStrLn event.compress
     stream.flush
 
-private def writeCatalog (path : String) (humanOnly : Bool) : CommandElabM Unit := do
+private def writeCatalog (path : String) : CommandElabM Unit := do
   let env ← getEnv
   let modules := env.header.moduleNames
   let mut rows := #[]
@@ -61,15 +55,14 @@ private def writeCatalog (path : String) (humanOnly : Bool) : CommandElabM Unit 
     let some index := env.getModuleIdxFor? name | continue
     let moduleName := modules[index.toNat]!.toString
     unless moduleName.startsWith "Mathlib." do continue
-    if humanOnly && ((← findDeclarationRanges? name).isNone || (← isProjectionFn name)) then continue
+    if (← findDeclarationRanges? name).isNone || (← isProjectionFn name) then continue
     rows := rows.push <| (Json.mkObj [
       ("name", toJson name.toString), ("module", toJson moduleName),
-      ("catalog_strategy", toJson (if humanOnly then "lean-auto-style" else "hammer")),
+      ("catalog_strategy", toJson "lean-auto-style"),
       ("type_size", toJson info.type.sizeWithoutSharing)]).compress
   IO.FS.writeFile path (String.intercalate "\n" rows.toList ++ "\n")
 
-elab "hammer_mathlib_catalog " path:str : command => writeCatalog path.getString false
-elab "hammer_mathlib_proof_catalog " path:str : command => writeCatalog path.getString true
+elab "hammer_mathlib_proof_catalog " path:str : command => writeCatalog path.getString
 
 /-- Direct theorem dependencies, excluding pure logic as in EvalAuto.useAuto.
 This deliberately does not recurse into proofs of the selected premises. -/
@@ -84,20 +77,6 @@ private def proofPremisesOf (info : ConstantInfo) : CoreM (Array Name) := do
 
 def proofPremises (target : Name) : CoreM (Array Name) := do
   proofPremisesOf (← getConstInfo target)
-
-elab "hammer_mathlib_statements " selection:str " to " output:str : command => do
-  let text ← IO.FS.readFile selection.getString
-  let mut rows := #[]
-  for line in text.splitOn "\n" do
-    if line.isEmpty then continue
-    let info ← getConstInfo line.toName
-    let statement ← liftTermElabM <| withOptions (fun opts =>
-        (opts.setBool `pp.universes true).set `pp.width (100 : Nat)) do
-      return (← ppExpr info.type).pretty
-    rows := rows.push <| (Json.mkObj [
-      ("name", toJson line), ("universes", toJson (info.levelParams.map Name.toString)),
-      ("statement", toJson statement), ("type_size", toJson info.type.sizeWithoutSharing)]).compress
-  IO.FS.writeFile output.getString (String.intercalate "\n" rows.toList ++ "\n")
 
 /-- Follow proof dependencies through imported declarations, so aliases or
 automatically selected lemmas cannot indirectly reuse the target theorem. -/
@@ -121,8 +100,7 @@ def auditDependencies (proof : Expr) (target : Name) :
         pending := pending ++ value.getUsedConstants
   return (reusesTarget, axioms, seen.size)
 
-private def tryTheorem (target : Name) (path : String) (useProofPremises : Bool)
-    (original? : Option ConstantInfo := none) : TermElabM Unit := do
+private def tryTheorem (target : Name) (path : String) (info : ConstantInfo) : TermElabM Unit := do
   let start ← IO.monoNanosNow
   appendEvent path <| Json.mkObj [
     ("event", toJson "started"), ("name", toJson target.toString),
@@ -131,19 +109,16 @@ private def tryTheorem (target : Name) (path : String) (useProofPremises : Bool)
   let prover := selectedProver (← getOptions)
   let selected ← IO.mkRef (#[] : Array Name)
   let attempt : TermElabM Unit := do
-    let info ← match original? with
-      | some info => pure info
-      | none => getConstInfo target
     unless isTheorem info do throwError "benchmark target is not a theorem"
-    let premises ← if useProofPremises then proofPremisesOf info else pure #[]
+    let premises ← proofPremisesOf info
     selected.set premises
     let some builder := (← benchmarkTactics.get)[prover]?
       | throwError "benchmark prover {prover} is not registered; import its Benchmark.Prover adapter"
-    let tactic ← withOptions (fun options => options.setBool `benchmark.proofPremises useProofPremises) <|
+    let tactic ← withOptions (fun options => options.setBool `benchmark.proofPremises true) <|
       builder premises
     appendEvent path <| Json.mkObj [
       ("event", toJson "premises"), ("name", toJson target.toString),
-      ("evaluation_strategy", toJson (if useProofPremises then "lean-auto-style" else "hammer")),
+      ("evaluation_strategy", toJson "lean-auto-style"),
       ("premises", toJson (premises.map Name.toString))]
     let proofStart ← IO.monoNanosNow
     let heartbeatStart ← IO.getNumHeartbeats
@@ -164,27 +139,25 @@ private def tryTheorem (target : Name) (path : String) (useProofPremises : Bool)
       ("event", toJson "proof_checked"), ("name", toJson target.toString),
       ("seconds", toJson ((proofEnd - start).toFloat / 1000000000))]
     let heartbeatEnd ← IO.getNumHeartbeats
-    let (reusesTarget, axioms, dependencies) ← if useProofPremises then
+    let (reusesTarget, axioms, dependencies) ←
       withTheReader Core.Context (fun ctx => { ctx with maxHeartbeats := 0 }) <| auditDependencies proof target
-    else
-      auditDependencies proof target
     let hasSorry := axioms.contains ``sorryAx
     let reconstructionModes := (← benchmarkProofModes.get) proof
     let route := if prover != "vampire-hammer" then prover else
       if reconstructionModes.isEmpty then "direct" else "vampire"
     let status := if hasSorry then "sorry" else if reusesTarget then "reuses_target" else "proved"
     let endTime ← IO.monoNanosNow
-    let seconds := (if useProofPremises then proofEnd - start else endTime - start).toFloat / 1000000000
+    let seconds := (proofEnd - start).toFloat / 1000000000
     appendEvent path <| Json.mkObj [
       ("event", toJson "finished"), ("name", toJson target.toString),
       ("status", toJson status), ("seconds", toJson seconds),
       ("prover", toJson prover),
       ("route", toJson route), ("route_source", toJson "accepted_proof"),
       ("reconstruction_modes", toJson reconstructionModes),
-      ("evaluation_strategy", toJson (if useProofPremises then "lean-auto-style" else "hammer")),
+      ("evaluation_strategy", toJson "lean-auto-style"),
       ("premise_count", toJson premises.size), ("premises", toJson (premises.map Name.toString)),
       ("heartbeats_raw", toJson (heartbeatEnd - heartbeatStart)),
-      ("target_in_environment", toJson (original?.isNone)),
+      ("target_in_environment", toJson false),
       ("setup_seconds", toJson ((proofStart - start).toFloat / 1000000000)),
       ("audit_seconds", toJson ((endTime - proofEnd).toFloat / 1000000000)),
       ("axioms", toJson (axioms.map Name.toString)),
@@ -201,9 +174,8 @@ private def tryTheorem (target : Name) (path : String) (useProofPremises : Bool)
       ("prover", toJson prover),
       ("premises", toJson ((← selected.get).map Name.toString)),
       ("error", toJson message), ("kernel_checked", toJson false)]
-  -- `try` does not catch heartbeat or recursion limits. Under the proof-premise
-  -- strategy these are ordinary failures of this theorem, not of the replay.
-  if useProofPremises then tryCatchRuntimeEx attempt failed else tryCatch attempt failed
+  -- Heartbeat and recursion limits are theorem failures, not replay failures.
+  tryCatchRuntimeEx attempt failed
 
 /-- Loading environment extensions runs the imported modules' initializers,
 as the `lean` executable itself does for every file. -/
@@ -289,7 +261,7 @@ def replayDeclarations (targets : Array Name) (sourceFile : System.FilePath) (pa
       ("event", toJson "replay_started"), ("name", toJson target.toString),
       ("source_file", toJson sourceFile.toString)]
   let replayOptions := if asModule then mathlibOptions else {}
-  let replayOptions := if options.getBool `vampire.benchmarkComparison false then
+  let replayOptions := if options.getBool `benchmark.comparison false then
     replayOptions.set `maxHeartbeats (0 : Nat)
       |>.set `synthInstance.maxHeartbeats (0 : Nat)
   else
@@ -324,7 +296,7 @@ def replayDeclarations (targets : Array Name) (sourceFile : System.FilePath) (pa
     if (previous.find? target).isSome then
       throw <| IO.userError "target theorem unexpectedly exists before its declaration"
     let run : CoreM Unit := do
-      (Term.TermElabM.run' <| tryTheorem target path true (some info)).run'
+      (Term.TermElabM.run' <| tryTheorem target path info).run'
     -- In a batch, target `i` writes its problems next to the configured
     -- output as `{i:05d}.p`, so their diagnostics stay separate.
     let outputPath := options.get `vampire.outputPath ""
@@ -438,9 +410,6 @@ private def tryReplayedTheorems (targets : Array Name) (moduleName : Name) (path
   catch error =>
     let reason ← error.toMessageData.toString
     recordFailures (targets.map (·, reason))
-
-elab "hammer_mathlib_try " declaration:str " recording " path:str : command =>
-  liftTermElabM <| tryTheorem declaration.getString.toName path.getString false
 
 elab "hammer_mathlib_try_with_premises " declaration:str " recording " path:str : command =>
   liftCoreM <| tryReplayedTheorem declaration.getString.toName path.getString

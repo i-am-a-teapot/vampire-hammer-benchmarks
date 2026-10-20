@@ -36,12 +36,9 @@ def package_root(name, project=None):
                 if package['type'] == 'path':
                     return (project / package['dir']).resolve()
                 return (project / data.get('packagesDir', '.lake/packages') / name).resolve()
-    if name == 'vampire_hammer':
-        # Permit direct invocation from the solver repository as well.
-        return project
     if name == 'tptp_parser':
         return hammer_project(project) / 'vendor/tptp_parser'
-    return project / '.lake/packages' / name
+    raise ValueError(f'dependency {name!r} is not recorded in {manifest}')
 
 
 def hammer_project(project=None):
@@ -146,20 +143,6 @@ def sample(rows, count, seed):
     return selected
 
 
-def select_from_corpus(corpus, names, count):
-    """Reuse statements and IDs for a focused comparison with an earlier run."""
-    rows = read_rows(corpus / "lemmas.jsonl")
-    if names:
-        requested = set(names.read_text().splitlines()) - {""}
-        missing = requested - {row["name"] for row in rows}
-        if missing:
-            raise ValueError(f"names absent from corpus: {sorted(missing)}")
-        rows = [row for row in rows if row["name"] in requested]
-    if not rows:
-        raise ValueError("selection is empty")
-    return rows[:count]
-
-
 def bounded_wrapper(output, binary, memory):
     wrapper = output / "vampire-bounded.py"
     wrapper.write_text(
@@ -214,7 +197,7 @@ def case_command(row, output, events, search_seconds=5, case_options=""):
             f'set_option vampire.timeLimit {search_seconds} in\n'
             f'set_option vampire.diagnosticCase {lean_string(row["name"])} in\n'
             f'set_option vampire.outputPath {lean_string(str(problem))} in\n'
-            f'hammer_mathlib_try {lean_string(row["name"])} recording {lean_string(str(events))}\n')
+            f'hammer_mathlib_try_with_premises {lean_string(row["name"])} recording {lean_string(str(events))}\n')
 
 
 COMPARISON_HEARTBEAT_OPTIONS = (
@@ -234,7 +217,7 @@ def case_options_prelude(pairs):
 
 
 def main():
-    spec = importlib.util.spec_from_file_location('isolated_local', PROJECT / 'slurmrunner/isolated.py')
+    spec = importlib.util.spec_from_file_location('isolated_local', PROJECT / 'scripts/hammer_bench/backends.py')
     isolated = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(isolated)
     return isolated.local_main(sys.argv[1:], PROJECT)

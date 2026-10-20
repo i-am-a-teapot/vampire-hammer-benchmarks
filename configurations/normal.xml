@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Standard six-prover comparison on the full lean-auto-style Mathlib catalog.
+     A saved testcase selection or a seeded sample can be selected on the CLI. -->
+<benchmark timelimit="600 s" walltimelimit="660 s" memlimit="8 GB"
+           cpu-cores="1" success-seconds="10">
+  <tasks/>
+
+  <option name="--search-seconds">10</option>
+
+  <rundefinition name="vampire-hammer">
+    <option name="--prover">vampire-hammer</option>
+    <option name="--case-option">vampire.suggestedLemmas=0</option>
+    <option name="--case-option">vampire.siblingLemmas=false</option>
+    <option name="--case-option">vampire.omitUnsupportedLocalHypotheses=true</option>
+    <option name="--case-option">vampire.alignNestedDefinitions=true</option>
+  </rundefinition>
+
+  <rundefinition name="duper">
+    <option name="--prover">duper</option>
+    <option name="--case-option">maxSaturationIteration=1000000000</option>
+  </rundefinition>
+
+  <rundefinition name="aesop">
+    <option name="--prover">aesop</option>
+  </rundefinition>
+
+  <rundefinition name="simp_all">
+    <option name="--prover">simp_all</option>
+  </rundefinition>
+
+  <rundefinition name="grind">
+    <option name="--prover">grind</option>
+  </rundefinition>
+
+  <rundefinition name="lean-auto-duper">
+    <option name="--prover">lean-auto-duper</option>
+  </rundefinition>
+</benchmark>

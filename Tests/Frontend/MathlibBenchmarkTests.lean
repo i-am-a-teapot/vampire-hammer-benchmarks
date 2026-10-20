@@ -37,6 +37,7 @@ run_elab do
   IO.FS.createDirAll directory
   let source := System.FilePath.mk "Tests/Frontend/BenchmarkReplayFixture.lean"
   let options := (← getOptions).set `maxHeartbeats (65536 : Nat)
+    |>.set `vampire.benchmarkProver "rfl"
   for (target, expected) in #[(`BenchmarkReplayFixture.target, "proved"),
                               (`BenchmarkReplayFixture.excluded, "excluded")] do
     let path := directory / s!"{target}.jsonl"
@@ -48,15 +49,15 @@ run_elab do
       | .ok event => pure event
       | .error error => throwError "invalid benchmark event: {error}"
     let some finished := events.find? (fun event =>
-        event.getObjValAs? String "event" == .ok "finished")
+        (event.getObjValAs? String "event").toOption == some "finished")
       | throwError "replay did not finish"
-    unless finished.getObjValAs? String "status" == .ok expected do
+    unless (finished.getObjValAs? String "status").toOption == some expected do
       throwError "unexpected replay result: {finished.compress}"
     if expected == "proved" then
-      unless finished.getObjValAs? Bool "target_in_environment" == .ok false do
+      unless (finished.getObjValAs? Bool "target_in_environment").toOption == some false do
         throwError "replay exposed the target to the tactic"
-      unless finished.getObjValAs? (Array String) "premises" == .ok #["BenchmarkReplayFixture.premise"] do
+      unless (finished.getObjValAs? (Array String) "premises").toOption == some #["BenchmarkReplayFixture.premise"] do
         throwError "replay used the wrong premise list"
     else
-      unless finished.getObjValAs? String "exclusion_reason" == .ok "same_command_dependency" do
+      unless (finished.getObjValAs? String "exclusion_reason").toOption == some "same_command_dependency" do
         throwError "replay did not apply the same-command filter"

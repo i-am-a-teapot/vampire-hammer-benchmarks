@@ -1,4 +1,26 @@
-# Extraction validation
+# Isolated prover validation
+
+The isolated-project refactor was checked with Lean 4.34.1 and Python 3.14:
+
+- All 101 Python tests and both shared-core Lean regressions pass.
+- The core builds without Vampire-Hammer, Duper or lean-auto dependencies.
+- Independent `simp_all` and Duper projects build and pass their replay smoke
+  tests, including premise extraction, kernel checking and same-command exclusion.
+- Duper resolves upstream lean-auto at `6b2774cde4d1cb7ac4d48ac61c34e950e0588d69`;
+  the `simp_all` environment has no lean-auto module path.
+- The local entry point generates one suite for both backends, batches source
+  replay by module, and collects all four results for two Mathlib theorems
+  through the same worker and collector used by Slurm. Proof successes and
+  unsuccessful tactic attempts remain separate outcomes.
+- Python regressions cover all seven project templates, equal build sequences,
+  per-backend Slurm configurations, module-path isolation, stale-source checks,
+  subset comparison denominators, local execution and resume.
+
+No Slurm jobs were submitted. The remaining native solver environments were
+not rebuilt as part of this refactor; their generated adapters use the existing
+pinned dependencies and tactic configurations.
+
+# Historical extraction validation
 
 Validated with Lean 4.34.1 and Python 3.14 against an isolated working-source
 copy of `vampire-hammer-clean` and its clean pinned Lean-auto dependency.

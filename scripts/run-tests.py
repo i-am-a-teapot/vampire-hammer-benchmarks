@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Run the extracted benchmark's Python and Lean regressions."""
 import argparse
-import importlib.util
 import os
 from pathlib import Path
 import signal
@@ -10,16 +9,12 @@ import sys
 import unittest
 
 PROJECT = Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location('benchmark_mathlib', PROJECT / 'scripts/benchmark-mathlib.py')
-benchmark = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(benchmark)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('files', nargs='*', type=Path)
     parser.add_argument('--suite', choices=('python', 'lean', 'all'), default='python')
-    parser.add_argument('--vampire', type=Path, default=benchmark.vampire_executable())
     parser.add_argument('--timeout', type=float, default=180)
     parser.add_argument('--list', action='store_true')
     args = parser.parse_args()
@@ -42,10 +37,8 @@ def main():
             if args.list:
                 print(path)
                 continue
-            command = ['lake', '-R', '-KbuildVampire=false', 'lean', str(path), '--', '-j', '1',
-                       f'-Dweak.vampire.executable={args.vampire.resolve()}']
-            environment = dict(os.environ, VAMPIRE_BIN=str(args.vampire.resolve()))
-            process = subprocess.Popen(command, cwd=PROJECT, start_new_session=True, env=environment)
+            command = ['lake', 'lean', str(path), '--', '-j', '1']
+            process = subprocess.Popen(command, cwd=PROJECT, start_new_session=True)
             try:
                 code = process.wait(timeout=args.timeout)
             except (subprocess.TimeoutExpired, KeyboardInterrupt):

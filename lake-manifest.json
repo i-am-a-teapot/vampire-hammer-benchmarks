@@ -3,60 +3,6 @@
   "packagesDir": ".lake/packages",
   "packages": [
     {
-      "type": "path",
-      "scope": "",
-      "name": "vampire_hammer",
-      "manifestFile": "lake-manifest.json",
-      "inherited": false,
-      "dir": "../vampire-hammer-clean",
-      "configFile": "lakefile.lean"
-    },
-    {
-      "type": "git",
-      "scope": "",
-      "name": "Duper",
-      "manifestFile": "lake-manifest.json",
-      "inherited": false,
-      "url": "https://github.com/leanprover-community/duper",
-      "rev": "9e09cd05fd541d6cef4c485882b7978d32c7e0a3",
-      "inputRev": "9e09cd05fd541d6cef4c485882b7978d32c7e0a3",
-      "subDir": null,
-      "configFile": "lakefile.lean"
-    },
-    {
-      "type": "path",
-      "scope": "",
-      "name": "tptp_parser",
-      "manifestFile": "lake-manifest.json",
-      "inherited": true,
-      "dir": "../vampire-hammer-clean/vendor/tptp_parser",
-      "configFile": "lakefile.lean"
-    },
-    {
-      "url": "https://github.com/vprover/vamplean",
-      "type": "git",
-      "subDir": null,
-      "scope": "",
-      "rev": "fda0586b716ae9844bb33cbe0d2053730afcc16b",
-      "name": "vamplean",
-      "manifestFile": "lake-manifest.json",
-      "inputRev": "fda0586b716ae9844bb33cbe0d2053730afcc16b",
-      "inherited": true,
-      "configFile": "lakefile.toml"
-    },
-    {
-      "url": "https://github.com/i-am-a-teapot/lean-auto",
-      "type": "git",
-      "subDir": null,
-      "scope": "",
-      "rev": "a2f825aca7e56ac2f6b3b502bc1290369fc6d5f5",
-      "name": "auto",
-      "manifestFile": "lake-manifest.json",
-      "inputRev": "a2f825aca7e56ac2f6b3b502bc1290369fc6d5f5",
-      "inherited": true,
-      "configFile": "lakefile.lean"
-    },
-    {
       "url": "https://github.com/leanprover-community/mathlib4",
       "type": "git",
       "subDir": null,
@@ -120,12 +66,12 @@
       "url": "https://github.com/leanprover-community/aesop",
       "type": "git",
       "subDir": null,
-      "scope": "",
+      "scope": "leanprover-community",
       "rev": "355695d523e41d0554926416cba2a2b3544fbbc9",
       "name": "aesop",
       "manifestFile": "lake-manifest.json",
-      "inputRev": "355695d523e41d0554926416cba2a2b3544fbbc9",
-      "inherited": false,
+      "inputRev": "master",
+      "inherited": true,
       "configFile": "lakefile.toml"
     },
     {

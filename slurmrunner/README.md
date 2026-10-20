@@ -9,14 +9,17 @@ Follow the [build and run instructions](../README.md) for a comparison suite.
 For Vampire-Hammer alone, generate a suite with:
 
 ```sh
-python3 slurmrunner/make-suite.py --strategy lean-auto-style --compact \
+python3 slurmrunner/make-suite.py --backends artifacts/provers/backends.json \
+  --prover vampire-hammer --strategy lean-auto-style --compact \
   --count 100 --output ../lean-auto-style-suite
 ```
 
 Omit `--count` for the full catalog. Generate suites on the filesystem where
 they will run: paths are absolute. Rebuild and regenerate after source or
-dependency changes. `suite-config.json` records revisions, settings, and
-the prover fingerprint. Each script provides `--help`.
+dependency changes. `suite-config.json` indexes one configuration per prover, recording revisions,
+settings and solver fingerprints in the individual configurations. Each references its own project, Lean environment,
+adapter and dependency manifest; Slurm and BenchExec select it with the same
+`--config` argument. Each script provides `--help`.
 
 ## Run and collect
 

@@ -6,7 +6,9 @@ run_elab do
   let directory := System.FilePath.mk "artifacts/comparison-benchmark-tests"
   IO.FS.createDirAll directory
   let source := System.FilePath.mk "Tests/Frontend/ComparisonBenchmarkFixture.lean"
-  for prover in #["vampire-hammer", "duper", "aesop", "simp_all", "grind"] do
+  -- External tactics are checked in their isolated projects, never imported
+  -- together into this shared-core regression.
+  for prover in #["simp_all", "grind"] do
     let options := (← getOptions).set `maxHeartbeats (0 : Nat)
     let options := options.set `vampire.benchmarkProver prover
     let options := options.setBool `vampire.benchmarkComparison true
@@ -21,20 +23,19 @@ run_elab do
         | .ok event => pure event
         | .error error => throwError "invalid benchmark event: {error}"
       let some finished := events.find? (fun event =>
-          event.getObjValAs? String "event" == .ok "finished")
+          (event.getObjValAs? String "event").toOption == some "finished")
         | throwError "{prover} did not finish"
-      unless finished.getObjValAs? String "status" == .ok expected do
+      unless (finished.getObjValAs? String "status").toOption == some expected do
         throwError "{prover}: unexpected result {finished.compress}"
       if expected == "proved" then
-        unless finished.getObjValAs? Bool "kernel_checked" == .ok true &&
-            finished.getObjValAs? Bool "reuses_target" == .ok false &&
-            finished.getObjValAs? Bool "target_in_environment" == .ok false do
+        unless (finished.getObjValAs? Bool "kernel_checked").toOption == some true &&
+            (finished.getObjValAs? Bool "reuses_target").toOption == some false &&
+            (finished.getObjValAs? Bool "target_in_environment").toOption == some false do
           throwError "{prover}: proof was not independently kernel checked"
-        unless finished.getObjValAs? (Array String) "premises" ==
-            .ok #["ComparisonBenchmarkFixture.premise"] do
+        unless (finished.getObjValAs? (Array String) "premises").toOption == some #["ComparisonBenchmarkFixture.premise"] do
           throwError "{prover}: wrong premise list"
-        unless events.any (fun event => event.getObjValAs? String "event" == .ok "proof_checked") do
+        unless events.any (fun event => (event.getObjValAs? String "event").toOption == some "proof_checked") do
           throwError "{prover}: no kernel-check timing boundary"
       else
-        unless finished.getObjValAs? String "exclusion_reason" == .ok "same_command_dependency" do
+        unless (finished.getObjValAs? String "exclusion_reason").toOption == some "same_command_dependency" do
           throwError "{prover}: same-command filter was not applied"

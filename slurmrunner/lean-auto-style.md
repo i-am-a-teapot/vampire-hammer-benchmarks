@@ -15,10 +15,12 @@ The strategy itself runs VampireHammer. For Duper baselines, use
 First [build the mathlib harness](README.md). From the repository root:
 
 ```sh
-python3 slurmrunner/make-suite.py --strategy lean-auto-style --count 100 \
+python3 slurmrunner/make-suite.py --backends artifacts/provers/backends.json \
+  --prover vampire-hammer --strategy lean-auto-style --count 100 \
   --case-option vampire.parallel=false --case-option vampire.routedSlices=false \
   --case-option vampire.higherOrder=false --output ../lean-auto-style-fo
-python3 slurmrunner/make-suite.py --strategy lean-auto-style --count 100 \
+python3 slurmrunner/make-suite.py --backends artifacts/provers/backends.json \
+  --prover vampire-hammer --strategy lean-auto-style --count 100 \
   --catalog ../lean-auto-style-fo/catalog.jsonl \
   --case-option vampire.parallel=false --case-option vampire.routedSlices=false \
   --case-option vampire.higherOrder=true --output ../lean-auto-style-ho

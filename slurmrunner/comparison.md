@@ -1,8 +1,23 @@
+# Isolated prover projects
+
+The supported comparison workflow uses one Lake project per prover:
+
+```sh
+python3 slurmrunner/prepare-provers.py --output artifacts/provers --build
+python3 slurmrunner/make-suite.py --backends artifacts/provers/backends.json \
+  --comparison --compact --count 100 --output ../comparison-isolated
+```
+
+Repeat `--prover NAME` to select projects when preparing or generating a suite.
+The projects share only the benchmark harness and pinned corpus, not `auto`
+packages or tactic imports. Environment replay, premise selection,
+kernel check, target-reuse audit and Slurm runner remain shared. Backend imports
+can differ; targets already imported by a tactic are excluded uniformly.
+
 # Tactic comparisons
 
-`make-suite.py --comparison` compares VampireHammer, Duper, Aesop,
-`simp_all` and `grind`. Each tactic receives the same direct theorem
-dependencies and local hypotheses in the environment before the target
+`make-suite.py --backends REGISTRY --comparison` compares the selected backends.
+Each tactic receives the same direct theorem dependencies and local hypotheses in the environment before the target
 declaration. The original proof supplies premise names and eligibility only.
 
 The common default is a 10-second proof budget, including premise extraction,
@@ -25,10 +40,11 @@ From the repository root:
 ```sh
 lake -R update
 lake -R exe cache get
-lake -R build \
-  VampireHammerBenchmark
+lake -R build VampireHammerBenchmark
+python3 slurmrunner/prepare-provers.py --output artifacts/provers --build
 
-python3 slurmrunner/make-suite.py --comparison --compact --count 12 \
+python3 slurmrunner/make-suite.py --backends artifacts/provers/backends.json \
+  --comparison --compact --count 12 \
   --search-seconds 10 --success-seconds 10 --output ../comparison-pilot
 python3 slurmrunner/slurmbench.py submit-packed ../comparison-pilot/vampire-hammer.xml \
   -p PARTITION --nodes 1 --cpus-per-node 4 --mem 32G --shards 1 \
@@ -42,66 +58,27 @@ resources for your cluster. For an FO-only or HO-only VampireHammer run, add
 `--case-option vampire.routedSlices=false` and
 `--case-option vampire.higherOrder=false` or `true`.
 
-## Upstream lean-auto baseline
+## Solver dependencies and eligibility
 
-A sixth tactic, upstream lean-auto + Duper, uses an isolated project so it can
-load unmodified Auto rather than VampireHammer's fork:
+`prepare-provers.py` prepares `vampire-hammer`, `duper`, `aesop`, `simp_all`,
+`grind`, `lean-auto-duper`, and `lean-smt`. Select a subset with repeatable
+`--prover NAME` arguments. All projects use the same preparation and build
+sequence, and each adapter imports only its own tactic dependencies.
 
-```sh
-python3 slurmrunner/prepare-lean-auto.py --output ../upstream-auto-benchmark
-```
+Lean-SMT uses the cvc5 FFI rather than a `cvc5` executable on `PATH`; native
+build requirements are documented by [lean-cvc5](https://github.com/abdoo8080/lean-cvc5).
+Its adapter runs `smt +mono -trust -native [*, premises]`. Only reconstructed,
+kernel-checked proofs count as successes.
 
-In that directory, run `lake update`, `lake exe cache get` and `lake build`.
-Add `--lean-auto-project ../upstream-auto-benchmark` when generating the suite.
-Dependency versions and harness compatibility are checked during generation.
-After updating the shared benchmark harness, regenerate the upstream project
-in a new directory and rebuild it, then generate a new suite. Existing suites
-record absolute paths and source snapshots from their preparation.
+Suite generation verifies matching Lean and Mathlib versions and records each
+backend's dependency revisions, imports, adapter and runtime configuration.
+Theorems already imported by any tactic are excluded as
+`baseline_import_dependency`, including targets present only in the meta layer.
+The common eligible comparison excludes these cases for every tool.
 
 Collection writes `comparison-search10.json` and `.tsv`, including common
 eligible, available-subset and pairwise results. Use `--partial` for progress;
 publish full-corpus rates only after a complete collection.
-
-## Lean-SMT / cvc5 baseline
-
-Lean-SMT's `smt` tactic is a separate baseline from upstream lean-auto + Duper.
-It runs in its own project, with pinned Lean-SMT, upstream lean-auto and
-Lean cvc5 FFI dependencies. The FFI provides cvc5; a `cvc5` executable on
-`PATH` is not used. The project uses the benchmark's Lean version and mathlib
-revision. Native FFI build requirements are documented by
-[lean-cvc5](https://github.com/abdoo8080/lean-cvc5).
-
-```sh
-python3 slurmrunner/prepare-lean-smt.py --output ../lean-smt-benchmark
-(
-  cd ../lean-smt-benchmark
-  lake update
-  lake exe cache get
-  lake build
-  lake lean Smoke.lean
-)
-python3 slurmrunner/make-suite.py --comparison --compact \
-  --lean-auto-project ../upstream-auto-benchmark \
-  --lean-smt-project ../lean-smt-benchmark \
-  --search-seconds 10 --success-seconds 10 --output ../comparison-full-smt
-```
-
-Omitting `--count` selects the full catalog. Submit and collect this suite with
-the same commands above (and fresh result directories). `--lean-smt-project`
-adds the `lean-smt` runset, using `intros; smt +mono -trust -native [*, premises]`.
-Only fully reconstructed, kernel-checked proofs count; unfilled reconstruction
-goals and trusted solver answers cannot count as successes. The same wall-clock
-budget, two zero heartbeat limits, per-module batching, and sequential
-repetitions apply. Internal preprocessing windows remain unchanged.
-
-Generation verifies a current shared harness, clean pinned solver dependencies,
-and matching Lean/mathlib versions. Solver dependency revisions and the isolated
-harness/configuration are recorded in the suite. The optional project has its
-own imports and lean-auto revision; these differences are recorded for reporting.
-Theorems already imported by the solver dependency are excluded as
-`baseline_import_dependency`, including targets present only in the meta layer.
-The common eligible comparison excludes these cases for every tool, preserving
-the requirement that the target is absent before its benchmark attempt.
 
 `--batch-by-module 16` amortizes startup within one module and tactic.
 Per-theorem proof seconds are the timing metric; CPU/RSS values belong to the

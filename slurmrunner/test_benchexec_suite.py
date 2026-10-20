@@ -13,6 +13,8 @@ import unittest
 from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
+PROVERS = ("vampire-hammer", "duper", "aesop", "simp_all", "grind")
+COMPARISON_IMPORTS = "import Mathlib\nimport VampireHammerBenchmark.Comparison\n"
 
 
 def load(name, filename):
@@ -29,21 +31,6 @@ suite = load("make_suite", "make-suite.py")
 
 
 class RepositoryTests(unittest.TestCase):
-    def test_compact_snapshot_retains_source_content_and_hashes(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            project = Path(temporary) / 'project'
-            project.mkdir()
-            source = project / 'Source.lean'
-            source.write_text('theorem example : True := True.intro\n')
-            output = Path(temporary) / 'suite'
-            output.mkdir()
-            with patch.object(suite, 'PROJECT', project), \
-                    patch.object(suite.benchmark, 'source_files', return_value=[('hammer/Source.lean', source)]):
-                hashes = suite.snapshot(output, compact=True)
-            self.assertFalse((output / 'source-snapshot').exists())
-            self.assertEqual(hashes['hammer/Source.lean'], suite.hashlib.sha256(source.read_bytes()).hexdigest())
-            with suite.tarfile.open(output / 'source-snapshot.tar.gz') as archive:
-                self.assertEqual(archive.extractfile('hammer/Source.lean').read(), source.read_bytes())
 
     def test_compact_tasks_roundtrip_without_per_theorem_files(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -54,128 +41,25 @@ class RepositoryTests(unittest.TestCase):
             self.assertFalse((output / 'tasks').exists())
             self.assertEqual(len(list(output.iterdir())), 1)
             args = types.SimpleNamespace(case_option=[], keep_artifacts=False, comparison=True,
+                                         backend_configs={name: output / f'{name}-config.json' for name in PROVERS},
                                          compact=True, shard_size=2, search_seconds=[10], timelimit='180 s',
                                          memlimit='8 GB', cpu_cores=1, hardtimelimit=None, walltimelimit='240 s')
             xml = output / 'benchmark.xml'
             xml.write_text(suite.benchmark_xml(args, output / 'suite-config.json', shards))
             parsed = slurmbench.parse_xml(xml)
-            self.assertEqual(len(parsed['jobs']), len(rows) * len(suite.PROVERS))
-            for prover in suite.PROVERS:
+            self.assertEqual(len(parsed['jobs']), len(rows) * len(PROVERS))
+            for prover in PROVERS:
                 jobs = [job for job in parsed['jobs'] if prover in job['args']]
                 self.assertEqual({job['theorem'] for job in jobs}, {row['name'] for row in rows})
                 for job in jobs:
                     self.assertEqual(job['args'][-2:], ['--theorem', job['theorem']])
                     self.assertIn('theorems.jsonl#', job['input'])
 
-    def test_comparison_suite_generates_time_limited_runs_per_theorem(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            project = Path(temporary) / 'project'
-            binary = project / '.lake/vampire/build/vampire'
-            binary.parent.mkdir(parents=True)
-            binary.write_text('#!/bin/sh\nexit 0\n')
-            binary.chmod(0o755)
-            output = Path(temporary) / 'suite'
-            with patch.object(suite, 'PROJECT', project), patch.object(suite, 'LAKE', suite.LAKE), \
-                    patch.object(suite.benchmark, 'PROJECT', suite.benchmark.PROJECT), \
-                    patch.object(sys, 'argv', ['make-suite.py', '--comparison', '--output', str(output)]), \
-                    patch.object(suite, 'check_built'), \
-                    patch.object(suite, 'lean_environment', return_value=('/toolchain/bin/lean', {})), \
-                    patch.object(suite, 'native_lean_args', return_value=['--plugin=/comparison.so']) as native, \
-                    patch.object(suite, 'hammer_revision', return_value='revision'), \
-                    patch.object(suite, 'output_of', return_value='Lean 4.34.1'), \
-                    patch.object(suite.subprocess, 'check_output', return_value='mathlib-revision\n'), \
-                    patch.object(suite, 'parser_dynlib', return_value=project / 'parser.so'), \
-                    patch.object(suite, 'snapshot', return_value={}), \
-                    patch.object(suite, 'select', return_value=([
-                        {'id': 0, 'name': 'Nat.add_comm', 'module': 'Mathlib.Data.Nat.Basic'}], 1)):
-                self.assertEqual(suite.main(), 0)
-            cfg = json.loads((output / 'suite-config.json').read_text())
-            self.assertEqual(cfg['provers'], list(suite.PROVERS))
-            self.assertEqual(cfg['diagnostic_provers'], ['vampire-hammer'])
-            self.assertEqual(cfg['evaluation_strategy'], 'lean-auto-style')
-            self.assertIn('maxHeartbeats=0', cfg['case_options'])
-            for option in suite.benchmark.COMPARISON_HEARTBEAT_OPTIONS:
-                self.assertIn(f'{option}=0', cfg['case_options'])
-            self.assertFalse(any(pair.startswith(('auto.mono.ciInstDefEq.maxHeartbeats=',
-                                                 'auto.mono.termLikeDefEq.maxHeartbeats=',
-                                                 'vampire.monoHeartbeats=')) for pair in cfg['case_options']))
-            self.assertNotIn('maxHeartbeats=65536', cfg['case_options'])
-            self.assertEqual(cfg['proof_timeout_seconds'], 10)
-            self.assertEqual(cfg['process_wall_seconds'], 600)
-            native.assert_called_once_with(imports=suite.COMPARISON_IMPORTS)
-            manifest = slurmbench.parse_xml(output / 'vampire-hammer.xml')
-            self.assertEqual(len(manifest['jobs']), len(suite.PROVERS))
-            self.assertEqual({job['args'][job['args'].index('--prover') + 1] for job in manifest['jobs']},
-                             set(suite.PROVERS))
-            self.assertEqual(len({job['input'] for job in manifest['jobs']}), 1)
-
-    def test_six_prover_xml_selects_isolated_config_once(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            output = Path(temporary)
-            args = types.SimpleNamespace(case_option=[], keep_artifacts=False, comparison=True,
-                                         lean_auto_project=output / 'upstream', compact=True,
-                                         shard_size=1000, search_seconds=[10], timelimit='300 s',
-                                         memlimit='8 GB', cpu_cores=1, hardtimelimit=None, walltimelimit='360 s')
-            suite.write_tasks([{'id': 0, 'name': 'Nat.add_comm', 'module': 'Mathlib.Data.Nat.Basic'}], output, 1000, compact=True)
-            xml = output / 'benchmark.xml'
-            xml.write_text(suite.benchmark_xml(args, output / 'suite-config.json', [0]))
-            manifest = slurmbench.parse_xml(xml)
-            self.assertEqual(len(manifest['jobs']), 6)
-            for job in manifest['jobs']:
-                self.assertEqual(job['args'].count('--config'), 1)
-                prover = job['args'][job['args'].index('--prover') + 1]
-                config = job['args'][job['args'].index('--config') + 1]
-                self.assertEqual(Path(config).name, 'lean-auto-config.json' if prover == 'lean-auto-duper' else 'suite-config.json')
-
-    def test_seven_prover_xml_selects_smt_isolated_config(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            output = Path(temporary)
-            args = types.SimpleNamespace(case_option=[], keep_artifacts=False, comparison=True,
-                                         lean_auto_project=output / 'upstream', lean_smt_project=output / 'smt',
-                                         compact=True, shard_size=1000, search_seconds=[10], timelimit='300 s',
-                                         memlimit='8 GB', cpu_cores=1, hardtimelimit=None, walltimelimit='360 s')
-            suite.write_tasks([{'id': 0, 'name': 'Nat.add_comm', 'module': 'Mathlib.Data.Nat.Basic'}], output, 1000, compact=True)
-            xml = output / 'benchmark.xml'
-            xml.write_text(suite.benchmark_xml(args, output / 'suite-config.json', [0]))
-            jobs = slurmbench.parse_xml(xml)['jobs']
-            self.assertEqual(len(jobs), 7)
-            for job in jobs:
-                prover = slurmbench.job_prover(job)
-                self.assertEqual(job['args'].count('--config'), 1)
-                config = job['args'][job['args'].index('--config') + 1]
-                expected = {'lean-smt': 'lean-smt-config.json', 'lean-auto-duper': 'lean-auto-config.json'}.get(prover, 'suite-config.json')
-                self.assertEqual(Path(config).name, expected)
-
-    def test_prepare_smt_preserves_kernel_audit_and_pins_solver(self):
-        preparation = load('prepare_lean_smt', 'prepare-lean-smt.py')
-        with tempfile.TemporaryDirectory() as temporary:
-            output = Path(temporary) / 'project'
-            with patch.object(sys, 'argv', ['prepare-lean-smt.py', '--output', str(output)]):
-                preparation.main()
-            harness = (output / 'VampireHammerBenchmark/Mathlib.lean').read_text()
-            tactic = (output / 'VampireHammerBenchmark/Comparison.lean').read_text()
-            for fragment in ('auditDependencies proof target', 'proofPremisesOf info', 'addDecl <| .thmDecl'):
-                self.assertIn(fragment, harness)
-            self.assertNotIn('VampireHammer.Replay', harness)
-            self.assertIn('(env.setExporting false).find? target', harness)
-            self.assertIn('baseline_import_dependency', harness)
-            self.assertIn('if targets.isEmpty then return #[]', harness)
-            self.assertIn('smt +mono -trust -native [*, $[$hints],*]', tactic)
-            self.assertIn(preparation.SMT_REV, (output / 'lakefile.lean').read_text())
-            self.assertIn(preparation.CVC5_REV, (output / 'lakefile.lean').read_text())
-            work = output / 'case'
-            work.mkdir()
-            source, _ = runner.write_case(work, 'Nat.add_comm', '/unused', '/unused', 10, '',
-                                         'lean-auto-style', 'lean-smt', suite.COMPARISON_IMPORTS, True)
-            text = source.read_text()
-            for option in ('executable', 'tptpParserDynlib', 'timeLimit', 'diagnosticCase', 'outputPath'):
-                self.assertNotIn('set_option vampire.' + option, text)
-            self.assertIn('set_option synthInstance.maxHeartbeats 0', text)
 
     def test_smt_comparison_keeps_missing_and_excluded_cases_out(self):
         with tempfile.TemporaryDirectory() as temporary:
             completed = []
-            for prover in (*suite.PROVERS, 'lean-auto-duper', 'lean-smt'):
+            for prover in (*PROVERS, 'lean-auto-duper', 'lean-smt'):
                 for task in ('A', 'B'):
                     job = {'input': task, 'args': ['--prover', prover, '--search-seconds', '10']}
                     excluded = prover == 'lean-smt' and task == 'B'
@@ -192,19 +76,6 @@ class RepositoryTests(unittest.TestCase):
             self.assertEqual(report['common_completed'], 0)
             self.assertIn('lean-smt', report['provers'])
 
-    def test_upstream_config_rejects_hammer_fork(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            project = Path(temporary)
-            harness = suite.PROJECT / 'VampireHammerBenchmark/Mathlib.lean'
-            (project / 'upstream-benchmark.json').write_text(json.dumps({
-                'harness_sha256': suite.hashlib.sha256(harness.read_bytes()).hexdigest()}))
-            (project / 'lake-manifest.json').write_text(json.dumps({'packages': [{
-                'name': 'auto', 'url': 'https://github.com/i-am-a-teapot/lean-auto',
-                'rev': 'a2f825aca7e56ac2f6b3b502bc1290369fc6d5f5'}]}))
-            original = suite.PROJECT
-            with self.assertRaisesRegex(SystemExit, 'normal upstream'):
-                suite.upstream_config(project, {})
-            self.assertEqual(suite.PROJECT, original)
 
     def test_source_snapshot_provenance_works_without_git(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -291,7 +162,7 @@ class RepositoryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             source, _ = runner.write_case(Path(temporary), 'Nat.add_comm', '/unused', '/unused',
                                          10, 'set_option maxHeartbeats 0 in\n', 'lean-auto-style',
-                                         'lean-auto-duper', suite.COMPARISON_IMPORTS, True,
+                                         'lean-auto-duper', COMPARISON_IMPORTS, True,
                                          'Mathlib.Data.Nat.Basic')
             text = source.read_text()
             self.assertIn('hammer_mathlib_try_with_premises_in_module', text)
@@ -302,12 +173,12 @@ class RepositoryTests(unittest.TestCase):
 
     def test_comparison_preserves_vampire_internal_heartbeat_windows(self):
         self.assertNotIn('vampire.monoHeartbeats', runner.benchmark.COMPARISON_HEARTBEAT_OPTIONS)
-        for prover in (*suite.PROVERS, 'lean-auto-duper', 'lean-smt'):
+        for prover in (*PROVERS, 'lean-auto-duper', 'lean-smt'):
             with self.subTest(prover=prover), tempfile.TemporaryDirectory() as temporary:
                 source, _ = runner.write_case(Path(temporary), 'Nat.add_comm', '/unused', '/unused',
                                              10, 'set_option vampire.monoHeartbeats 8000 in\n'
                                              if prover == 'vampire-hammer' else '', 'lean-auto-style',
-                                             prover, suite.COMPARISON_IMPORTS, True)
+                                             prover, COMPARISON_IMPORTS, True)
                 text = source.read_text()
                 self.assertIn('set_option maxHeartbeats 0\n', text)
                 self.assertIn('set_option synthInstance.maxHeartbeats 0\n', text)
@@ -317,23 +188,14 @@ class RepositoryTests(unittest.TestCase):
                     self.assertIn('set_option vampire.monoHeartbeats 8000 in\n', text)
                     self.assertNotIn('set_option vampire.monoHeartbeats 0', text)
 
-    def test_upstream_harness_preserves_replay_and_audit(self):
-        preparation = load('prepare_lean_auto', 'prepare-lean-auto.py')
-        text = preparation.harness_source((HERE.parent / 'VampireHammerBenchmark/Mathlib.lean').read_text())
-        self.assertNotIn('import VampireHammer\n', text)
-        self.assertNotIn('by vampire', text)
-        self.assertNotIn('VampireHammer.Replay', text)
-        for fragment in ('addDecl <| .thmDecl', 'auditDependencies proof target',
-                         'proofPremisesOf info', 'replayDeclarations targets', 'same_command_dependency'):
-            self.assertIn(fragment, text)
 
     def test_missing_upstream_results_keep_six_way_denominator(self):
         with tempfile.TemporaryDirectory() as temporary:
             completed = []
-            for prover in suite.PROVERS:
+            for prover in PROVERS:
                 job = {'input': 'A', 'args': ['--prover', prover, '--search-seconds', '10'], 'theorem': 'A'}
                 completed.append((job, {'status': 'true', 'extracted': {'outcome': 'proved'}}, None))
-            slurmbench.comparison_diagnostics(Path(temporary), completed, [*suite.PROVERS, 'lean-auto-duper'])
+            slurmbench.comparison_diagnostics(Path(temporary), completed, [*PROVERS, 'lean-auto-duper'])
             report = json.loads((Path(temporary) / 'comparison-search10.json').read_text())
             self.assertIn('lean-auto-duper', report['provers'])
             self.assertEqual(report['common_completed'], 0)
@@ -357,48 +219,6 @@ class RepositoryTests(unittest.TestCase):
         for command in commands[1:]:
             self.assertEqual(command[:2], ["lake", "-R"])
 
-    def test_suite_targets_separate_checkout(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            project = Path(temporary) / "vampire-hammer"
-            binary = project / ".lake/vampire/build/vampire"
-            binary.parent.mkdir(parents=True)
-            binary.write_text("#!/bin/sh\nexit 0\n")
-            binary.chmod(0o755)
-            harness = project / "VampireHammerBenchmark/Mathlib.lean"
-            harness.parent.mkdir(parents=True)
-            harness.write_text("-- benchmark harness\n")
-            (project / "lean-toolchain").write_text("leanprover/lean4:v4.34.1\n")
-            output = Path(temporary) / "suite"
-            rows = [{"id": 0, "name": "Nat.add_comm", "module": "Mathlib.Data.Nat.Basic"}]
-            with patch.object(suite, "PROJECT", suite.PROJECT), \
-                    patch.object(suite.benchmark, "PROJECT", suite.benchmark.PROJECT), \
-                    patch.object(sys, "argv", ["make-suite.py", "--project", str(project), "--output", str(output),
-                                               "--strategy", "lean-auto-style"]), \
-                    patch.object(suite, "check_built"), \
-                    patch.object(suite, "lean_environment", return_value=("/toolchain/bin/lean", {})), \
-                    patch.object(suite, "native_lean_args", return_value=["--plugin=/lib/hammer.so"]), \
-                    patch.object(suite, "hammer_revision", return_value="new-revision"), \
-                    patch.object(suite, "output_of", return_value="Lean 4.34.1"), \
-                    patch.object(suite.subprocess, "check_output", return_value="mathlib-revision\n"), \
-                    patch.object(suite, "parser_dynlib", return_value=project / "parser.so"), \
-                    patch.object(suite, "select", return_value=(rows, 1)):
-                self.assertEqual(suite.main(), 0)
-                self.assertEqual(suite.benchmark.PROJECT, project)
-            config = json.loads((output / "suite-config.json").read_text())
-            self.assertEqual(config["project"], str(project))
-            self.assertEqual(config["vampire"], str(binary))
-            self.assertEqual(config["hammer_revision"], "new-revision")
-            self.assertEqual(config["lean_args"], ["--plugin=/lib/hammer.so"])
-            self.assertEqual(config["evaluation_strategy"], "lean-auto-style")
-            self.assertEqual(config["success_seconds"], 10)
-            self.assertEqual(config["search_seconds"], 10)
-            self.assertIn("maxHeartbeats=0", config["case_options"])
-            self.assertIn("vampire.omitUnsupportedLocalHypotheses=true", config["case_options"])
-            self.assertIn("vampire.alignNestedDefinitions=true", config["case_options"])
-            self.assertIn("project/VampireHammerBenchmark/Mathlib.lean", config["source_hashes"])
-            self.assertIn("project/lean-toolchain", config["source_hashes"])
-            self.assertIn(str(suite.TOOL_PROJECT / "slurmrunner/run-hammer-task"),
-                          (output / "vampire-hammer.xml").read_text())
 
     def test_runner_fallback_uses_benchmark_package(self):
         command, env = runner.lean_command({}, Path("case.lean"))
@@ -708,7 +528,7 @@ class RunnerTests(unittest.TestCase):
             order = []
 
             def batch_case(directory, remaining, wrapper, parser_dynlib, search_seconds, case_options,
-                           prover, imports, comparison, module):
+                           prover, imports, comparison, module, adapter_module=None):
                 order.append('attempt:' + '+'.join(remaining))
                 events = directory / 'events.jsonl'
                 rows = [{'event': 'started', 'name': remaining[0]},
@@ -839,7 +659,7 @@ class SlurmbenchHammerTests(unittest.TestCase):
                    'created': '2026-10-13T00:00:00Z', 'seconds': 180, 'mem_mb': 8192, 'cpus': 1,
                    'jobs': []}
             results = {}
-            for idx, prover in enumerate(suite.PROVERS):
+            for idx, prover in enumerate(PROVERS):
                 job = {'input': '000000-T.thm', 'runset': f'{prover}-search10',
                        'args': ['--prover', prover, '--search-seconds', '10', '000000-T.thm']}
                 cfg['jobs'].append(job)
@@ -970,7 +790,7 @@ class SlurmbenchHammerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             completed = []
             for theorem in ('A', 'B', 'excluded'):
-                for prover in suite.PROVERS:
+                for prover in PROVERS:
                     solved = (theorem == 'A' and prover in {'vampire-hammer', 'aesop'}) or (theorem == 'B' and prover == 'duper')
                     data = {'status': 'true' if solved else 'unknown',
                             'extracted': {'theorem': theorem, 'outcome': 'excluded' if theorem == 'excluded' else 'proved' if solved else 'search_unsuccessful'}}

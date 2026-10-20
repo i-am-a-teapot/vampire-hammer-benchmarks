@@ -1,10 +1,8 @@
 import importlib.util
 import json
-import os
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
 
 
 spec = importlib.util.spec_from_file_location("benchmark_mathlib", Path(__file__).resolve().parents[2] / "scripts/benchmark-mathlib.py")
@@ -13,17 +11,6 @@ spec.loader.exec_module(benchmark)
 
 
 class BenchmarkTests(unittest.TestCase):
-    def test_resume_rejects_changed_vampire_binary(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            binary = Path(temporary) / "vampire"
-            binary.write_bytes(b"first build")
-            config = {"vampire": str(binary), "vampire_sha256": benchmark.binary_hash(binary)}
-            benchmark.verify_vampire_binary(config)
-            binary.write_bytes(b"second build")
-            with self.assertRaisesRegex(RuntimeError, "executable changed"):
-                benchmark.verify_vampire_binary(config)
-            with self.assertRaisesRegex(RuntimeError, "no Vampire binary fingerprint"):
-                benchmark.verify_vampire_binary({"vampire": str(binary)})
 
     def test_sampling_balances_modules_and_is_reproducible(self):
         rows = [{"name": f"{module}.{index}", "module": module}
@@ -102,100 +89,6 @@ class BenchmarkTests(unittest.TestCase):
         self.assertIn("ContinuousLinearMap.extendTo𝕜'_apply", source)
         self.assertIn('"run-𝕜/problems/00042.p"', source)
         self.assertNotIn("\\ud835", source)
-
-    def test_unexpected_event_restarts_tail_without_accepting_foreign_result(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            output = Path(temporary)
-            (output / "chunks").mkdir()
-            (output / "problems").mkdir()
-            executable = output / "lake"
-            executable.write_text('''#!/usr/bin/env python3
-import json, pathlib, re, sys
-source = pathlib.Path(next(a for a in sys.argv[1:] if a.endswith('.lean'))).read_text()
-for name, events in re.findall(r'hammer_mathlib_try ("[^"\\n]+") recording ("[^"\\n]+")', source):
-    name, events = json.loads(name), pathlib.Path(json.loads(events))
-    if name == 'bad':
-        name = '[anonymous]'
-    with events.open('a') as stream:
-        stream.write(json.dumps({'event': 'started', 'name': name}) + '\\n')
-        stream.write(json.dumps({'event': 'finished', 'name': name, 'status': 'proved'}) + '\\n')
-''')
-            executable.chmod(0o700)
-            recorded = []
-            environment = {"PATH": str(output) + os.pathsep + os.environ["PATH"]}
-            with patch.dict(os.environ, environment), patch.object(benchmark, "PROJECT", output):
-                benchmark.run_chunk(
-                    [{"id": 1, "name": "bad"}, {"id": 2, "name": "quick"}],
-                    output, output / "unused-wrapper", 1, 0, recorded.append,
-                )
-            self.assertEqual([(row["name"], row["status"]) for row in recorded],
-                             [("bad", "infrastructure_error"), ("quick", "proved")])
-            self.assertIn("Unexpected benchmark event", recorded[0]["error"])
-            self.assertEqual(len(list((output / "chunks").glob("*.lean"))), 2)
-
-    def test_aborted_command_does_not_poison_later_results(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            output = Path(temporary)
-            (output / "chunks").mkdir()
-            (output / "problems").mkdir()
-            executable = output / "lake"
-            executable.write_text('''#!/usr/bin/env python3
-import json, pathlib, re, sys
-source = pathlib.Path(next(a for a in sys.argv[1:] if a.endswith('.lean'))).read_text()
-for name, events in re.findall(r'hammer_mathlib_try ("[^"\\n]+") recording ("[^"\\n]+")', source):
-    name, events = json.loads(name), pathlib.Path(json.loads(events))
-    with events.open('a') as stream:
-        stream.write(json.dumps({'event': 'started', 'name': name}) + '\\n')
-        if name != 'aborted':
-            stream.write(json.dumps({'event': 'premises', 'name': name, 'premises': []}) + '\\n')
-            stream.write(json.dumps({'event': 'proof_checked', 'name': name}) + '\\n')
-            stream.write(json.dumps({'event': 'finished', 'name': name, 'status': 'proved'}) + '\\n')
-sys.exit(1)
-''')
-            executable.chmod(0o700)
-            recorded = []
-            environment = {"PATH": str(output) + os.pathsep + os.environ["PATH"]}
-            with patch.dict(os.environ, environment), patch.object(benchmark, "PROJECT", output):
-                benchmark.run_chunk(
-                    [{"id": 1, "name": "aborted"}, {"id": 2, "name": "quick"}],
-                    output, output / "unused-wrapper", 1, 0, recorded.append,
-                )
-            self.assertEqual([(row["name"], row["status"]) for row in recorded],
-                             [("aborted", "process_error"), ("quick", "proved")])
-            self.assertEqual(len(list((output / "chunks").glob("*.lean"))), 1)
-
-    def test_timeout_restarts_only_the_unattempted_tail(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            output = Path(temporary)
-            (output / "chunks").mkdir()
-            (output / "problems").mkdir()
-            executable = output / "lake"
-            executable.write_text('''#!/usr/bin/env python3
-import json, pathlib, re, sys, time
-source = pathlib.Path(next(a for a in sys.argv[1:] if a.endswith('.lean'))).read_text()
-for name, events in re.findall(r'hammer_mathlib_try ("[^"\\n]+") recording ("[^"\\n]+")', source):
-    name, events = json.loads(name), pathlib.Path(json.loads(events))
-    def write(event):
-        with events.open('a') as stream:
-            stream.write(json.dumps(event) + '\\n')
-    write({'event': 'started', 'name': name})
-    if name == 'hang':
-        time.sleep(60)
-    write({'event': 'finished', 'name': name, 'status': 'proved'})
-''')
-            executable.chmod(0o700)
-            recorded = []
-            environment = {"PATH": str(output) + os.pathsep + os.environ["PATH"]}
-            with patch.dict(os.environ, environment), patch.object(benchmark, "PROJECT", output):
-                benchmark.run_chunk(
-                    [{"id": 1, "name": "hang"}, {"id": 2, "name": "quick"}],
-                    output, output / "unused-wrapper", 0.05, 0, recorded.append, search_seconds=20,
-                )
-            self.assertEqual([(row["name"], row["status"]) for row in recorded],
-                             [("hang", "timeout"), ("quick", "proved")])
-            self.assertTrue((output / "chunks/chunk-0000-01.lean").exists())
-            for chunk in (output / "chunks").glob("*.lean"):
-                self.assertIn('set_option vampire.timeLimit 20 in\n', chunk.read_text())
 
 
 if __name__ == "__main__":

@@ -1,9 +1,8 @@
-import VampireHammer
+import Lean
 import Lean.Util.CollectAxioms
-import Auto.EvaluateAuto.ConstAnalysis
-import Auto.EvaluateAuto.CommandAnalysis
+import Lean.DeclarationRange
 
-/-! Benchmark commands only. These do not change the hammer or its defaults.
+/-! Shared benchmark commands with no prover dependency.
 The default strategy supplies only the statement. The separate proof-premise
 strategy inspects the original proof only to extract theorem names, as in the
 Lean-auto/Duper evaluation; it never supplies the original proof term. -/
@@ -13,20 +12,36 @@ namespace VampireHammer.Benchmark
 open Lean Meta Elab Command
 
 register_option vampire.benchmarkProver : String := {
-  defValue := "vampire-hammer"
+  defValue := "simp_all"
   descr := "Benchmark tactic: vampire-hammer, duper, aesop, simp_all or grind"
 }
 register_option vampire.benchmarkComparison : Bool := {
   defValue := false
-  descr := "Load identical baseline imports for every comparison run"
+  descr := "Use comparison timing and heartbeat policy during source replay"
 }
+
+register_option benchmark.adapterModule : String := {
+  defValue := "VampireHammerBenchmark.Comparison"
+  descr := "Module registering the selected prover in this isolated Lake project"
+}
+
+register_option benchmark.prover : String := {
+  defValue := ""
+  descr := "Selected prover (empty uses the legacy vampire.benchmarkProver option)"
+}
+
+def selectedProver (options : Options) : String :=
+  let prover := benchmark.prover.get options
+  if prover.isEmpty then vampire.benchmarkProver.get options else prover
 
 initialize benchmarkTactics : IO.Ref (Std.HashMap String (Array Name → TermElabM Term)) ← IO.mkRef {}
 
-/-- Optional baseline imports register their syntax without adding dependencies
-to the ordinary hammer benchmark. All comparison runs import the same module. -/
+/-- Backend adapters register their syntax without adding tactic dependencies
+to the shared benchmark core. -/
 def registerBenchmarkTactic (name : String) (builder : Array Name → TermElabM Term) : IO Unit :=
   benchmarkTactics.modify (·.insert name builder)
+
+initialize benchmarkProofModes : IO.Ref (Expr → Array String) ← IO.mkRef (fun _ => #[])
 
 private def isTheorem : ConstantInfo → Bool
   | .thmInfo _ => true
@@ -46,7 +61,7 @@ private def writeCatalog (path : String) (humanOnly : Bool) : CommandElabM Unit 
     let some index := env.getModuleIdxFor? name | continue
     let moduleName := modules[index.toNat]!.toString
     unless moduleName.startsWith "Mathlib." do continue
-    if humanOnly && !(← liftCoreM <| EvalAuto.Name.isHumanTheorem name) then continue
+    if humanOnly && ((← findDeclarationRanges? name).isNone || (← isProjectionFn name)) then continue
     rows := rows.push <| (Json.mkObj [
       ("name", toJson name.toString), ("module", toJson moduleName),
       ("catalog_strategy", toJson (if humanOnly then "lean-auto-style" else "hammer")),
@@ -61,9 +76,10 @@ This deliberately does not recurse into proofs of the selected premises. -/
 private def proofPremisesOf (info : ConstantInfo) : CoreM (Array Name) := do
   let some proof := info.value? (allowOpaque := true)
     | throwError "benchmark target has no proof"
-  let names ← EvalAuto.Expr.getUsedTheorems proof
+  let names ← proof.getUsedConstants.filterM fun name => return (← getConstInfo name).isTheorem
   let names ← names.filterM fun name => do
-    return name != info.name && !(← EvalAuto.Name.onlyLogicInType name)
+    let logic := #[``True, ``False, ``Not, ``And, ``Or, ``Iff, ``Eq]
+    return name != info.name && !((← getConstInfo name).type.getUsedConstants.all logic.contains)
   return names.qsort (fun a b => a.toString < b.toString)
 
 def proofPremises (target : Name) : CoreM (Array Name) := do
@@ -112,7 +128,7 @@ private def tryTheorem (target : Name) (path : String) (useProofPremises : Bool)
     ("event", toJson "started"), ("name", toJson target.toString),
     ("monotonic_ns", toJson start)]
   let saved ← Term.saveState
-  let prover := vampire.benchmarkProver.get (← getOptions)
+  let prover := selectedProver (← getOptions)
   let selected ← IO.mkRef (#[] : Array Name)
   let attempt : TermElabM Unit := do
     let info ← match original? with
@@ -121,17 +137,10 @@ private def tryTheorem (target : Name) (path : String) (useProofPremises : Bool)
     unless isTheorem info do throwError "benchmark target is not a theorem"
     let premises ← if useProofPremises then proofPremisesOf info else pure #[]
     selected.set premises
-    let tactic : Term ← if prover != "vampire-hammer" then do
-      let some builder := (← benchmarkTactics.get)[prover]?
-        | throwError "benchmark prover {prover} is not registered; import VampireHammerBenchmark.Comparison"
+    let some builder := (← benchmarkTactics.get)[prover]?
+      | throwError "benchmark prover {prover} is not registered; import its Benchmark.Prover adapter"
+    let tactic ← withOptions (fun options => options.setBool `benchmark.proofPremises useProofPremises) <|
       builder premises
-    else if useProofPremises then do
-      let terms : Array Term := premises.map (fun name => ⟨mkIdent name⟩)
-      let hints ← terms.mapM (fun term => `(Auto.hintelem| $term:term))
-      let hints := #[(← `(Auto.hintelem| *))] ++ hints
-      `(term| by intros; vampire [$[$hints],*])
-    else
-      `(term| by vampire)
     appendEvent path <| Json.mkObj [
       ("event", toJson "premises"), ("name", toJson target.toString),
       ("evaluation_strategy", toJson (if useProofPremises then "lean-auto-style" else "hammer")),
@@ -160,7 +169,7 @@ private def tryTheorem (target : Name) (path : String) (useProofPremises : Bool)
     else
       auditDependencies proof target
     let hasSorry := axioms.contains ``sorryAx
-    let reconstructionModes := VampireHammer.Replay.reconstructionModes proof
+    let reconstructionModes := (← benchmarkProofModes.get) proof
     let route := if prover != "vampire-hammer" then prover else
       if reconstructionModes.isEmpty then "direct" else "vampire"
     let status := if hasSorry then "sorry" else if reusesTarget then "reuses_target" else "proved"
@@ -246,11 +255,7 @@ def replayDeclarations (targets : Array Name) (sourceFile : System.FilePath) (pa
   -- (instances, namespaces, notation) as Lean's own frontend does. The main
   -- module keeps private names identical to those in the original proof.
   enableInitializers
-  let benchmarkModule := if vampire.benchmarkProver.get options == "vampire-hammer" &&
-      !(options.getBool `vampire.benchmarkComparison false) then
-    `VampireHammerBenchmark.Mathlib
-  else
-    `VampireHammerBenchmark.Comparison
+  let benchmarkModule := (benchmark.adapterModule.get options).toName
   let asModule := asModule && Elab.HeaderSyntax.isModule header
   let (env, messages) ← if asModule then
       let initialized := (← getEnv).header.moduleNames
@@ -264,6 +269,20 @@ def replayDeclarations (targets : Array Name) (sourceFile : System.FilePath) (pa
     let reason := s!"benchmark could not import the replayed module's dependencies: \
       {← messages.toList.mapM fun message => message.data.toString}"
     return targets.map (·, reason)
+  -- Tactic dependencies can themselves import foundational corpus theorems.
+  -- Exclude these uniformly rather than benchmarking a target already loaded
+  -- by its backend (including declarations visible only to metaprograms).
+  let mut availableTargets := #[]
+  for target in targets do
+    if ((env.setExporting false).find? target).isSome then
+      appendEvent path <| Json.mkObj [
+        ("event", toJson "finished"), ("name", toJson target.toString),
+        ("status", toJson "excluded"), ("exclusion_reason", toJson "baseline_import_dependency"),
+        ("kernel_checked", toJson false)]
+    else
+      availableTargets := availableTargets.push target
+  let targets := availableTargets
+  if targets.isEmpty then return #[]
   let replayStart ← IO.monoNanosNow
   for target in targets do
     appendEvent path <| Json.mkObj [
@@ -308,7 +327,7 @@ def replayDeclarations (targets : Array Name) (sourceFile : System.FilePath) (pa
       (Term.TermElabM.run' <| tryTheorem target path true (some info)).run'
     -- In a batch, target `i` writes its problems next to the configured
     -- output as `{i:05d}.p`, so their diagnostics stay separate.
-    let outputPath := vampire.outputPath.get options
+    let outputPath := options.get `vampire.outputPath ""
     let options := if targets.size > 1 && !outputPath.isEmpty then
         let index := (targets.idxOf? target).getD 0
         let digits := toString index

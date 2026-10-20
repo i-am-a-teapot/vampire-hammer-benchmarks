@@ -932,6 +932,8 @@ def stage_hammer(cfg, scratch):
             if not config.get('lean'):
                 raise ValueError('Regenerate the suite: staging requires a recorded Lean binary')
             copy_tree(config['project'])
+            if config.get('shared_core_project'):
+                copy_tree(config['shared_core_project'])
             copy_tree(Path(config['lean']).resolve().parent.parent)
         copy_tree(executable.parent.parent)
         for config in configs.values():
@@ -960,7 +962,7 @@ def stage_hammer(cfg, scratch):
         local_configs = {}
         for index, (filename, config) in enumerate(configs.items()):
             local = dict(config)
-            for key in ('project', 'lean', 'vampire', 'tptp_parser_dynlib'):
+            for key in ('project', 'shared_core_project', 'lean', 'vampire', 'tptp_parser_dynlib'):
                 if local.get(key):
                     local[key] = relocate(local[key])
             local['lean_env'] = dict(config.get('lean_env', {}))
@@ -1415,6 +1417,11 @@ def comparison_diagnostics(out, completed, expected_provers=None):
         provers = ('vampire-hammer', 'lean-auto-duper', *provers[1:])
     if 'lean-smt' in (expected_provers or ()) or any('lean-smt' in rows for cases in groups.values() for rows in cases.values()):
         provers = (*provers, 'lean-smt')
+    if expected_provers is not None:
+        # A registry may select any subset of tools. Missing tools outside that
+        # selection must not reduce its common-completed denominator to zero.
+        selected = set(expected_provers)
+        provers = tuple(p for p in provers if p in selected) + tuple(sorted(selected - set(provers)))
     for budget, cases in groups.items():
         def summarize(selected):
             common = {task: rows for task, rows in cases.items() if all(p in rows for p in selected)}
@@ -1554,9 +1561,44 @@ def collect(ns):
         print('Missing indices:', ', '.join(map(str, missing[:30])))
 
 
+def run_local(ns):
+    """Use the same commands, batching, resource accounting and collector as Slurm."""
+    if ns.jobs <= 0 or ns.batch_by_module <= 0:
+        raise ValueError('--jobs and --batch-by-module must be positive')
+    output = Path(ns.output).resolve()
+    config = parse_xml(Path(ns.benchmark).resolve())
+    manifest = output / 'manifest.json'
+    if ns.resume:
+        previous = json.loads(manifest.read_text())
+        if any(previous.get(key) != config.get(key) for key in ('jobs', 'executable', 'seconds', 'workdir')):
+            raise ValueError('suite changed; resume requires the same tasks and command configuration')
+        config = previous
+    else:
+        output.mkdir(parents=True, exist_ok=False)
+        (output / 'logs').mkdir()
+        config.update(output=str(output), created=dt.datetime.now().astimezone().isoformat(),
+                      result_format='files', execution='local')
+        save_json(manifest, config)
+    done = usable_results(read_results(output)) if ns.resume else {}
+    groups = [[idx for idx in group if idx not in done] for group in batches(config, ns.batch_by_module)]
+    with ThreadPoolExecutor(max_workers=ns.jobs) as workers:
+        futures = [workers.submit(run_batch, config, group) for group in groups if group]
+        for future in futures:
+            future.result()
+    ns.manifest, ns.partial = str(manifest), False
+    collect(ns)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest='action', required=True)
+    local = sub.add_parser('run-local', help='Run a suite locally with the same runner and results as Slurm')
+    local.add_argument('benchmark')
+    local.add_argument('-o', '--output', required=True)
+    local.add_argument('-j', '--jobs', type=int, default=4)
+    local.add_argument('--batch-by-module', type=int, default=1)
+    local.add_argument('--resume', action='store_true')
+    local.set_defaults(func=run_local)
     s = sub.add_parser('submit', help='Submit array for XML benchmark')
     s.add_argument('benchmark')
     s.add_argument('--repetitions', type=int, default=1, help='Separate sequential job arrays for repeated runs (e.g. 3)')

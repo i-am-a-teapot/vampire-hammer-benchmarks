@@ -16,6 +16,7 @@ search budget and memory limit, which keep the same meaning as in
 
 import argparse
 import importlib.util
+import hashlib
 import json
 import math
 import os
@@ -42,6 +43,17 @@ def load_config(path):
     return json.loads(Path(path).read_text())
 
 
+def validate_isolated_config(config):
+    if not config.get('isolated_backend'):
+        return
+    for root_key, hashes_key in [('project', 'backend_source_hashes'),
+                                 ('shared_core_project', 'shared_core_source_hashes')]:
+        for relative, expected in config.get(hashes_key, {}).items():
+            path = Path(config[root_key]) / relative
+            if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+                raise ValueError(f'benchmark sources changed: {path}; rebuild and regenerate the suite')
+
+
 def lean_command(config, source):
     """Use the suite's recorded Lean environment and native-library flags;
     fall back to `lake lean`. Both load the precompiled hammer and lean-auto
@@ -51,13 +63,16 @@ def lean_command(config, source):
     unbuffered = ["stdbuf", "-oL", "-eL"] if shutil.which("stdbuf") else []
     if config.get("lean"):
         env = dict(os.environ)
+        if config.get('isolated_backend'):
+            for key in ('LEAN_PATH', 'LEAN_SRC_PATH', 'LEAN_SYSROOT'):
+                env.pop(key, None)
         env.update(config.get("lean_env", {}))
         return [*unbuffered, config["lean"], *config.get("lean_args", []), "-j", "1", str(source)], env
     return [*unbuffered, *benchmark.lean_command(source)], None
 
 
 def write_case(work, name, wrapper, parser_dynlib, search_seconds, case_options, strategy="hammer",
-               prover="vampire-hammer", imports=None, comparison=False, module=None):
+               prover="vampire-hammer", imports=None, comparison=False, module=None, adapter_module=None):
     """The same command sequence as one entry of a benchmark-mathlib chunk."""
     (work / "problems").mkdir()
     events = work / "events.jsonl"
@@ -78,6 +93,7 @@ def write_case(work, name, wrapper, parser_dynlib, search_seconds, case_options,
     else:
         header_options = ''
     header = (imports + header_options +
+              (f'set_option benchmark.adapterModule {benchmark.lean_string(adapter_module)}\n' if adapter_module else '') +
               f'set_option vampire.benchmarkProver {benchmark.lean_string(prover)}\n' +
               ('set_option vampire.benchmarkComparison true\n' if comparison else '') +
               f'set_option vampire.executable {benchmark.lean_string(str(wrapper))}\n'
@@ -94,11 +110,11 @@ def write_case(work, name, wrapper, parser_dynlib, search_seconds, case_options,
             command = command.replace(" recording ", f" module {benchmark.lean_string(module)} recording ", 1)
         else:
             command = command.replace("hammer_mathlib_try ", "hammer_mathlib_try_with_premises ", 1)
-    if prover in {"lean-auto-duper", "lean-smt"}:
+    if prover != "vampire-hammer":
         header = ''.join(line for line in header.splitlines(keepends=True)
                          if not line.startswith(('set_option vampire.executable ',
                                                  'set_option vampire.tptpParserDynlib ')))
-    if prover in {"lean-auto-duper", "lean-smt"}:
+    if prover != "vampire-hammer":
         command = ''.join(line for line in command.splitlines(keepends=True)
                           if not line.startswith(('set_option vampire.timeLimit ',
                                                   'set_option vampire.diagnosticCase ',
@@ -181,7 +197,7 @@ PROVER_OPTIONS = {"maxSaturationIteration": {"duper", "lean-auto-duper"}}
 
 
 def classify(name, events, returncode):
-    """Mirror run_chunk's handling of missing terminal events."""
+    """Record commands aborted before their terminal event."""
     finished = [event for event in events if event.get("event") == "finished"]
     if finished:
         return finished[-1]
@@ -347,10 +363,10 @@ def kill_tree(process):
 
 
 def write_batch_case(work, names, wrapper, parser_dynlib, search_seconds, case_options, prover,
-                     imports, comparison, module):
+                     imports, comparison, module, adapter_module=None):
     """One case replaying the defining module once for several targets."""
     source, events = write_case(work, names[0], wrapper, parser_dynlib, search_seconds, case_options,
-                                "lean-auto-style", prover, imports, comparison, module)
+                                "lean-auto-style", prover, imports, comparison, module, adapter_module)
     single = f'hammer_mathlib_try_with_premises_in_module {benchmark.lean_string(names[0])} module'
     text = source.read_text()
     if single not in text:
@@ -407,7 +423,7 @@ def run_batch(args, config, project, names, module, wrapper_for, parser_dynlib, 
         source, events = write_batch_case(directory, remaining, wrapper_for(directory), parser_dynlib,
                                           search_seconds, case_options, args.prover,
                                           config.get('benchmark_imports'), config.get('comparison', False),
-                                          module)
+                                          module, config.get('adapter_module'))
         command, env = lean_command(config, source)
         print(f"[run-hammer-task] batch of {len(remaining)} in {module}; attempt {attempt}", flush=True)
         started = time.monotonic()
@@ -466,8 +482,8 @@ def main():
                              "--module, whose file is then replayed once (lean-auto-style suites)")
     parser.add_argument("--module", help="defining module from the suite catalog; avoids full Mathlib startup for declaration replay")
     parser.add_argument("--config", help="suite-config.json written by make-suite.py")
-    parser.add_argument("--prover", choices=("vampire-hammer", "lean-auto-duper", "lean-smt", "duper", "aesop", "simp_all", "grind"),
-                        default="vampire-hammer", help="tactic to evaluate (baselines require the comparison imports)")
+    parser.add_argument("--prover",
+                        default=None, help="tactic to evaluate (defaults to the isolated config's prover)")
     parser.add_argument("--search-seconds", type=int, default=None, help="Vampire search budget (default: suite config, else 20)")
     parser.add_argument("--vampire-memory-mib", type=int, default=None, help="Vampire memory limit (default: suite config, else 512)")
     parser.add_argument("--case-option", action="append", default=[], metavar="NAME=VALUE",
@@ -482,12 +498,19 @@ def main():
     parser.add_argument("--version", action="store_true")
     args = parser.parse_args()
     config = load_config(args.config)
+    args.prover = args.prover or (config.get('provers', [None])[0] if config.get('isolated_backend') else 'vampire-hammer')
+    if config.get('isolated_backend') and args.prover not in config.get('provers', []):
+        parser.error(f'config supports {config.get("provers")}, not {args.prover}; select its matching backend config')
     project = Path(config.get("project", PROJECT)).expanduser().resolve()
 
     if args.version:
         print(f"vampire-hammer {config.get('hammer_revision', 'unknown')} "
               f"vampire-sha256:{config.get('vampire_sha256', 'unknown')[:12]}")
         return 0
+    try:
+        validate_isolated_config(config)
+    except ValueError as error:
+        parser.error(str(error))
     if (args.task is None) == (args.theorem is None):
         parser.error("give exactly one of a task file or --theorem")
     names = args.theorem or [task_theorem(args.task)]
@@ -496,7 +519,8 @@ def main():
     if module and any(not part.replace("'", "_").isidentifier() for part in module.split('.')):
         parser.error(f"invalid defining module: {module!r}")
 
-    vampire = config.get("vampire") or str(benchmark.vampire_executable(project))
+    vampire = ((config.get("vampire") or str(benchmark.vampire_executable(project)))
+               if args.prover == 'vampire-hammer' else None)
     expected = config.get("vampire_sha256")
     if args.prover == 'vampire-hammer' and expected and benchmark.binary_hash(vampire) != expected:
         print(RESULT_PREFIX + json.dumps({"name": name, "status": "infrastructure_error",
@@ -515,13 +539,14 @@ def main():
         configured_options += [f'{name}=0' for name in benchmark.COMPARISON_HEARTBEAT_OPTIONS]
     case_options = [pair for pair in configured_options
                     if args.prover in PROVER_OPTIONS.get(pair.partition("=")[0], {args.prover})
-                    and not (args.prover in {"lean-auto-duper", "lean-smt"} and pair.startswith("vampire."))]
+                    and not (args.prover != "vampire-hammer" and pair.startswith("vampire."))]
     case_options = benchmark.case_options_prelude(case_options)
     strategy = config.get("evaluation_strategy", "hammer")
     if strategy not in {"hammer", "lean-auto-style"}:
         parser.error(f"unknown evaluation strategy: {strategy}")
-    parser_dynlib = config.get("tptp_parser_dynlib") or str(
-        benchmark.package_root('tptp_parser', project) / '.lake/build/lib/libtptp_cparser.so')
+    parser_dynlib = ((config.get("tptp_parser_dynlib") or str(
+        benchmark.package_root('tptp_parser', project) / '.lake/build/lib/libtptp_cparser.so'))
+        if args.prover == 'vampire-hammer' else None)
 
     proof_limit = args.proof_timeout if args.proof_timeout is not None else config.get('proof_timeout_seconds')
     success_limit = min((limit for limit in (config.get('success_seconds'), proof_limit) if limit is not None), default=None)
@@ -568,7 +593,7 @@ def main():
             if strategy != "lean-auto-style" or not module:
                 parser.error("several --theorem need --module and a lean-auto-style suite")
             def wrapper_for(directory):
-                return benchmark.bounded_wrapper(directory, vampire, memory)
+                return benchmark.bounded_wrapper(directory, vampire, memory) if vampire else ''
             # Report each target as soon as it finishes: a batch killed at the
             # outer wall deadline keeps the results it already produced.
             status = [0]
@@ -586,9 +611,10 @@ def main():
                      search_seconds, case_options, work, report=report)
             return status[0]
 
-        wrapper = benchmark.bounded_wrapper(work, vampire, memory)
+        wrapper = benchmark.bounded_wrapper(work, vampire, memory) if vampire else ''
         source, events = write_case(work, name, wrapper, parser_dynlib, search_seconds, case_options, strategy,
-                                    args.prover, config.get('benchmark_imports'), config.get('comparison', False), module)
+                                    args.prover, config.get('benchmark_imports'), config.get('comparison', False),
+                                    module, config.get('adapter_module'))
         command, env = lean_command(config, source)
         header = f"[run-hammer-task] theorem {name}; prover {args.prover}"
         if args.prover == 'vampire-hammer':

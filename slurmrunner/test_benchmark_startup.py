@@ -116,6 +116,7 @@ class StartupTests(unittest.TestCase):
             directory = Path(temporary)
             suite.write_tasks([{'id':0,'name':'Int.example','module':'Mathlib.M'}], directory, 10, compact=True)
             args = types.SimpleNamespace(case_option=[], keep_artifacts=False, comparison=True,
+                backend_configs={'simp_all': directory / 'simp_all-config.json'},
                 compact=True, shard_size=10,search_seconds=[10],timelimit='180 s',memlimit='8 GB',
                 cpu_cores=1,hardtimelimit=None,walltimelimit='240 s')
             xml = directory/'benchmark.xml';xml.write_text(suite.benchmark_xml(args,directory/'suite-config.json',{0:1}))

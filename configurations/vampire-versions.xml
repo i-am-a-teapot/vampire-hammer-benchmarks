@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Ten shared testcases; identical options and budgets for both versions.
+     Standard is this repository's existing pin, not an upstream release tag. -->
+<benchmark timelimit="600 s" walltimelimit="660 s" memlimit="8 GB"
+           cpu-cores="1" success-seconds="10">
+  <tasks>
+    <option name="--count">10</option>
+    <option name="--seed">vampire-version-comparison</option>
+  </tasks>
+  <option name="--search-seconds">10</option>
+  <option name="--case-option">vampire.suggestedLemmas=0</option>
+  <option name="--case-option">vampire.siblingLemmas=false</option>
+  <option name="--case-option">vampire.omitUnsupportedLocalHypotheses=true</option>
+  <option name="--case-option">vampire.alignNestedDefinitions=true</option>
+  <rundefinition name="standard">
+    <option name="--prover">vampire-hammer</option>
+  </rundefinition>
+  <rundefinition name="latest">
+    <option name="--prover">vampire-hammer-latest</option>
+  </rundefinition>
+</benchmark>

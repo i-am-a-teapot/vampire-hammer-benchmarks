@@ -357,6 +357,34 @@ def prover_config(prover='vampire-hammer'):
 
 
 class RunnerTests(unittest.TestCase):
+    def test_versioned_vampire_keeps_solver_limits_diagnostics_and_distinct_result_identity(self):
+        stdout = io.StringIO()
+        config = {**prover_config('vampire-hammer-latest'), 'artifacts': 'vampire',
+                  'vampire_sha256': 'expected-binary'}
+        finished = {'event': 'finished', 'name': 'T', 'status': 'proved', 'route': 'vampire',
+                    'route_source': 'accepted_proof', 'reconstruction_modes': ['fo'],
+                    'seconds': 1.2, 'kernel_checked': True}
+        with patch.object(sys, 'argv', ['run-hammer-task', '--theorem', 'T', '--prover', 'vampire-hammer-latest']), \
+                patch.object(runner, 'load_config', return_value=config), \
+                patch.object(sys, 'stdout', stdout), patch.object(runner.subprocess, 'Popen') as popen, \
+                patch.object(runner, 'read_events', return_value=[finished]), \
+                patch.object(runner, 'vampire_details', return_value={'vampire_queries': 1}) as details, \
+                patch.object(runner.benchmark, 'bounded_wrapper', return_value='/bounded-vampire') as bounded, \
+                patch.object(runner.benchmark, 'binary_hash', return_value='expected-binary') as fingerprint, \
+                patch.object(runner, 'write_case', wraps=runner.write_case) as write:
+            popen.return_value.wait.return_value = 0
+            self.assertEqual(runner.main(), 0)
+        fingerprint.assert_called_once_with('/unused/vampire')
+        self.assertEqual(bounded.call_args.args[1:], ('/unused/vampire', 512))
+        self.assertEqual(write.call_args.args[2:4], ('/bounded-vampire', '/unused/parser.so'))
+        self.assertEqual(write.call_args.args[7], 'vampire-hammer')
+        details.assert_called_once()
+        self.assertIs(popen.call_args.kwargs['stdout'], stdout)
+        row = json.loads(stdout.getvalue().split(runner.RESULT_PREFIX)[1])
+        self.assertEqual(row['prover'], 'vampire-hammer-latest')
+        self.assertEqual(row['route'], 'vampire')
+        self.assertEqual(row['reconstruction_modes'], ['fo'])
+
     def test_saved_native_strategy_is_a_separate_query(self):
         with tempfile.TemporaryDirectory() as temporary:
             work = Path(temporary)

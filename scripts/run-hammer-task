@@ -507,6 +507,11 @@ def main():
     args.prover = args.prover or config['provers'][0]
     if args.prover not in config['provers']:
         parser.error(f'config supports {config["provers"]}, not {args.prover}; select its matching backend config')
+    backend_prover = args.prover
+    # Versioned Vampire backends have distinct result identities but share the
+    # canonical tactic protocol, bounded solver wrapper and diagnostic handling.
+    if config.get('artifacts') == 'vampire':
+        args.prover = 'vampire-hammer'
     project = Path(config['project']).expanduser().resolve()
     if (args.task is None) == (args.theorem is None):
         parser.error("give exactly one of a task file or --theorem")
@@ -548,7 +553,7 @@ def main():
         """Complete one theorem's result line from its recorded events."""
         event = apply_success_limit(event, success_limit)
         event.pop("event", None)
-        event['prover'] = args.prover
+        event['prover'] = backend_prover
         event["failure_kind"] = benchmark.failure_kind(event)
         if args.prover == 'vampire-hammer':
             event.update(vampire_details(directory, include_output=event['status'] not in {'proved', 'excluded'},
@@ -569,7 +574,7 @@ def main():
         if args.keep_artifacts and args.prover == 'vampire-hammer':
             # Without a container overlay concurrent runs share the working directory.
             stem = args.task.stem if args.task and len(names) == 1 else name
-            destination = Path(args.artifacts_dir) / args.prover / f'search{search_seconds}' / stem
+            destination = Path(args.artifacts_dir) / (args.run_label or backend_prover) / f'search{search_seconds}' / stem
             destination.mkdir(parents=True, exist_ok=True)
             event['artifacts_dir'] = str(destination)
             problems = sorted((directory / "problems").glob(f"{index:05d}.p*"))
@@ -592,7 +597,7 @@ def main():
             status = [0]
             def report(name, entry):
                 event, directory, index, source, events, returncode, wall = entry
-                header = f"[run-hammer-task] theorem {name}; prover {args.prover}"
+                header = f"[run-hammer-task] theorem {name}; prover {backend_prover}"
                 if args.prover == 'vampire-hammer':
                     header += f"; search {search_seconds}s; vampire memory {memory} MiB"
                 print(header, flush=True)
@@ -609,7 +614,7 @@ def main():
                                     args.prover, config.get('benchmark_imports'), config.get('comparison', False),
                                     module, config.get('adapter_module'))
         command, env = lean_command(config, source)
-        header = f"[run-hammer-task] theorem {name}; prover {args.prover}"
+        header = f"[run-hammer-task] theorem {name}; prover {backend_prover}"
         if args.prover == 'vampire-hammer':
             header += f"; search {search_seconds}s; vampire memory {memory} MiB"
         print(header, flush=True)

@@ -17,6 +17,19 @@ spec.loader.exec_module(preparation)
 
 
 class ProverDefinitionTests(unittest.TestCase):
+    def test_vampire_version_comparison_has_distinct_pins_and_canonical_registration(self):
+        definition = preparation.DEFAULT_DEFINITION.with_name('provers_vampire_versions.xml')
+        backends = preparation.load_definition(definition)
+        self.assertEqual(set(backends), {'vampire-hammer', 'vampire-hammer-latest'})
+        self.assertNotEqual(backends['vampire-hammer']['dependencies'][0]['commit'],
+                            backends['vampire-hammer-latest']['dependencies'][0]['commit'])
+        self.assertEqual(backends['vampire-hammer']['wrapper'], backends['vampire-hammer-latest']['wrapper'])
+        with tempfile.TemporaryDirectory() as temporary:
+            preparation.prepare(Path(temporary), definition=definition)
+            adapter = (Path(temporary) / 'vampire-hammer-latest/Benchmark/Prover.lean').read_text()
+            self.assertIn('initialize registerBenchmarkTactic "vampire-hammer-latest"', adapter)
+            self.assertIn('initialize registerBenchmarkTactic "vampire-hammer"', adapter)
+
     def test_default_environment_covers_the_standard_experiment_without_case_options(self):
         backends = preparation.load_definition(preparation.DEFAULT_DEFINITION)
         normal = ET.parse(preparation.DEFAULT_DEFINITION.with_name('normal.xml')).getroot()

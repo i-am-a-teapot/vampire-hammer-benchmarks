@@ -72,3 +72,41 @@ and definition hashes.
 Keep case options in experiment files such as `normal.xml`. Prover definitions
 and the generated build registry contain no case options. After changing a pin
 or wrapper, rerun preparation and regenerate execution suites.
+
+## Quick Vampire-Hammer version comparison
+
+`vampire-versions.xml` compares ten shared testcases with the same requested
+options and 10-second proof/search budgets. `standard` uses the existing
+`4c50a21de3e46e153a266322b0fff0db0f5270c7` pin; `latest` uses upstream `main`
+checked on 2026-10-20, pinned to `93e0c0c4d8121aa2d8ec0ff2a4d54f44d131c85a`.
+The two versions use separate Lake projects and solver builds. Unsupported case
+options are omitted and recorded per version, as for other experiments.
+
+From the repository root:
+
+```sh
+docker build \
+  --build-arg PROVERS=configurations/provers_vampire_versions.xml \
+  --build-arg EXPERIMENT=configurations/vampire-versions.xml \
+  --build-arg SAMPLE_SIZE=10 \
+  -t vampire-hammer-benchmark:versions .
+
+mkdir -p artifacts/docker-results
+
+docker run --rm --privileged --cap-drop=ALL --cgroupns=private \
+  --mount type=volume,src=vampire-hammer-versions-build,dst=/var/lib/benchmark \
+  --mount type=bind,src="$(pwd)/artifacts/docker-results",dst=/results \
+  vampire-hammer-benchmark:versions \
+  --count 10 --seed vampire-version-comparison --jobs 1 --output /results/versions-10
+
+python3 scripts/collect-results.py artifacts/docker-results/versions-10/results \
+  --suite artifacts/docker-results/versions-10/suite \
+  --jsonl artifacts/docker-results/versions-10.jsonl
+```
+
+The first container startup needs network access and compiles the environment.
+Keep the named volume for later runs; after preparation, `--network none` works.
+Increase `--count` for a larger sample and choose a new `--output` directory.
+For a newer upstream version later, resolve `git ls-remote
+https://github.com/vprover/vampire-hammer HEAD` and update the full commit in
+`provers/vampire-hammer-latest.xml` before rebuilding.

@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<prover-environment version="1">
+  <prover file="provers/vampire-hammer.xml"/>
+  <prover file="provers/vampire-hammer-latest.xml"/>
+</prover-environment>

@@ -285,6 +285,9 @@ def prepare(output, provers=None, build=False, definition=DEFAULT_DEFINITION, no
             '  roots := #[`Benchmark.Prover]\n'
             '  precompileModules := true\n'
             '  defaultFacets := #[LeanLib.sharedFacet]\n')
+        registrations = [prover]
+        if spec.get('artifacts') == 'vampire' and prover != 'vampire-hammer':
+            registrations.append('vampire-hammer')
         write_generated(directory / 'Benchmark/Prover.lean',
             # A minimal Mathlib import makes its shared library a native link
             # dependency. Lake then loads its complete dependency graph in
@@ -292,7 +295,8 @@ def prepare(output, provers=None, build=False, definition=DEFAULT_DEFINITION, no
             'import Mathlib.Init\nimport VampireHammerBenchmark.Comparison\n' + spec['imports'] +
             '\nnamespace VampireHammer.Benchmark\nopen Lean Elab Term\n\n' +
             spec['declarations'] + '\n' +
-            f'initialize registerBenchmarkTactic {json.dumps(prover)} ' + spec['wrapper'] +
+            ''.join(f'initialize registerBenchmarkTactic {json.dumps(name)} ' + spec['wrapper'] + '\n'
+                    for name in registrations) +
             '\nend VampireHammer.Benchmark\n')
         smoke = (PROJECT / 'Tests/Frontend/ComparisonBenchmarkTests.lean').read_text()
         smoke = smoke.replace('import VampireHammerBenchmark.Comparison', 'import Benchmark.Prover')

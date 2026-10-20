@@ -10,8 +10,6 @@ initialize benchmarkProofModes.set VampireHammer.Replay.reconstructionModes
   <wrapper><![CDATA[
 fun premises => do
   let terms : Array Term := premises.map fun name => ⟨mkIdent name⟩
-  let hints ← terms.mapM fun term => `(Auto.hintelem| $term:term)
-  let hints := #[(← `(Auto.hintelem| *))] ++ hints
-  `(term| by intros; vampire [$[$hints],*])
+  `(term| by intros; vampire [*, $[$terms:term],*])
 ]]></wrapper>
 </prover>

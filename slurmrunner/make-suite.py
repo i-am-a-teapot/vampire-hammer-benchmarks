@@ -56,7 +56,7 @@ def lean_environment(clean=False):
     return str(Path(prefix) / "bin" / "lean"), changed
 
 
-def native_lean_args(imports=None, lake=None, env=None):
+def native_lean_args(imports=None, lake=None, env=None, required_libraries=()):
     """`lean` flags that load the precompiled shared libraries, as `lake lean` does.
 
     Without them, `lean` runs the hammer's and lean-auto's metaprograms in its
@@ -77,6 +77,20 @@ def native_lean_args(imports=None, lake=None, env=None):
     for line in (result.stdout + result.stderr).splitlines():
         if marker in line:
             setup = json.loads(line.split(marker, 1)[1])
+            # Lean plugins initialize in dependency order, after external C
+            # dynlibs. Loading an adapter as a plain dynlib can precede its
+            # solver dependencies and leave unresolved native symbols.
+            loaded = {Path(plugin['path']).resolve() for plugin in setup.get('plugins', [])}
+            for library in required_libraries:
+                result = subprocess.run(
+                    [*lake, '--no-build', '--json', 'query', f'{library}:shared'],
+                    cwd=PROJECT, capture_output=True, text=True, env=env)
+                if result.returncode:
+                    raise ValueError(f'native library {library} is not built; rebuild the backend')
+                path = Path(json.loads(result.stdout)).resolve()
+                if path not in loaded:
+                    raise ValueError(f'native library {library} is not loaded as a Lean plugin; regenerate the prover '
+                                     'project with prepare-provers.py and rebuild it')
             # A precompiled library with several roots is not a plugin, so
             # Lean loads it at startup, before the plugins it needs (lean-auto).
             misplaced = [library for library in setup.get("dynlibs", [])

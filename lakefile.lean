@@ -9,4 +9,6 @@ package vampire_hammer_benchmark where
 require mathlib from git "https://github.com/leanprover-community/mathlib4" @ "v4.34.1"
 
 @[default_target]
-lean_lib VampireHammerBenchmark
+lean_lib VampireHammerBenchmark where
+  precompileModules := true
+  defaultFacets := #[LeanLib.sharedFacet]

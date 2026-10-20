@@ -46,6 +46,10 @@ def load_backends(path, selected=None):
         spec = dict(backends[name])
         project = Path(spec['project']).expanduser()
         spec['project'] = str((path.parent / project).resolve())
+        spec['shared_dependencies'] = {
+            package: {**dependency,
+                      'project': str((path.parent / Path(dependency['project']).expanduser()).resolve())}
+            for package, dependency in spec.get('shared_dependencies', {}).items()}
         if not (Path(spec['project']) / 'lakefile.lean').is_file():
             raise ValueError(f'backend {name} has no Lake project: {spec["project"]}')
         result[name] = spec
@@ -59,23 +63,39 @@ def backend_config(name, spec, args, namespace):
     imports = spec.get('benchmark_imports', f'import Mathlib\nimport {adapter}\n')
     if not all(part.isidentifier() for part in adapter.split('.')):
         raise ValueError(f'invalid adapter module: {adapter!r}')
+    shared = spec.get('shared_dependencies', {})
+    for package, dependency in shared.items():
+        resolved = benchmark.package_root(package, project)
+        expected = Path(dependency['project']).resolve()
+        if resolved != expected:
+            raise ValueError(f'backend {name}: {package} must use shared dependency {expected}')
+        if dependency.get('revision'):
+            revision = subprocess.check_output(['git', '-C', str(expected), 'rev-parse', 'HEAD'], text=True).strip()
+            if revision != dependency['revision']:
+                raise ValueError(f'shared dependency {package} changed revision; rebuild and regenerate the projects')
     with project_context(namespace, project):
         probe = subprocess.run(['lake', 'build', '--no-build', adapter], cwd=project,
                                capture_output=True, text=True, env=clean_environment())
         if probe.returncode:
             raise ValueError(f'build backend {name} first in {project}:\n{probe.stdout}{probe.stderr}')
         lean, environment = namespace['lean_environment'](clean=True)
-        flags = namespace['native_lean_args'](imports=imports, env=clean_environment())
+        native_libraries = ['Mathlib', 'VampireHammerBenchmark',
+                            spec.get('native_library', adapter.split('.')[0])]
+        flags = namespace['native_lean_args'](imports=imports, env=clean_environment(),
+                                             required_libraries=native_libraries)
         mathlib = benchmark.package_root('mathlib', project)
         mathlib_revision = subprocess.check_output(['git', '-C', str(mathlib), 'rev-parse', 'HEAD'], text=True).strip()
         lean_version = subprocess.check_output([lean, '--version'], text=True).strip()
         manifest = json.loads((project / 'lake-manifest.json').read_text())
         config = {
             'project': str(project), 'lean': lean, 'lean_env': environment, 'lean_args': flags,
+            'native_libraries': native_libraries,
             'lean_version': lean_version, 'mathlib_commit': mathlib_revision,
             'benchmark_imports': imports, 'adapter_module': adapter,
             'provers': [name], 'diagnostic_provers': [], 'isolated_backend': True,
-            'dependency_revisions': {p['name']: p.get('rev', p.get('dir')) for p in manifest['packages']},
+            'dependency_revisions': {p['name']: p.get('rev') or shared.get(p['name'], {}).get('revision')
+                                     or p.get('dir') for p in manifest['packages']},
+            'shared_dependencies': shared,
             'evaluation_strategy': args.strategy, 'comparison': args.comparison,
             'success_seconds': args.success_seconds,
             'proof_timeout_seconds': args.success_seconds,

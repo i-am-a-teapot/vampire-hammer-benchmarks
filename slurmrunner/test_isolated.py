@@ -4,6 +4,7 @@ import importlib.util
 import json
 import hashlib
 import os
+import shutil
 from pathlib import Path
 import sys
 import tempfile
@@ -26,18 +27,135 @@ preparation = load('prepare_isolated_test', 'prepare-provers.py')
 suite = load('suite_isolated_test', 'make-suite.py')
 runner = load('runner_isolated_test', 'run-hammer-task')
 slurm = load('slurm_isolated_test', 'slurmbench.py')
+relocation = load('relativize_isolated_test', '../scripts/relativize-provers.py')
 
 
 class IsolatedTests(unittest.TestCase):
+    def test_existing_compiled_projects_can_be_made_relative(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            core = Path(temporary) / 'original'
+            project = core / 'artifacts/provers/duper'
+            packages = project / '.lake/packages'
+            packages.mkdir(parents=True)
+            mathlib = core / '.lake/packages/mathlib'
+            mathlib.mkdir(parents=True)
+            (packages / 'mathlib').symlink_to(mathlib, target_is_directory=True)
+            (project / 'lakefile.lean').write_text(f'require core from {json.dumps(str(core))}\n')
+            (project / 'lake-manifest.json').write_text(json.dumps({'packages': [
+                {'name': 'core', 'type': 'path', 'dir': str(core)}]}))
+            binary = project / '.lake/build/lib/adapter.so'
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b'compiled artifact')
+            registry = project.parent / 'backends.json'
+            registry.write_text(json.dumps({'version': 1, 'backends': {
+                'duper': {'project': str(project), 'shared_dependencies': {
+                    'mathlib': {'project': str(mathlib)}}}}}))
+            relocation.relativize(core)
+            first = registry.read_bytes()
+            relocation.relativize(core)
+            self.assertEqual(first, registry.read_bytes())
+            moved = core.with_name('moved')
+            core.rename(moved)
+            spec = suite.isolated.load_backends(moved / 'artifacts/provers/backends.json')['duper']
+            project = Path(spec['project'])
+            self.assertEqual((project / '.lake/packages/mathlib').resolve(), moved / '.lake/packages/mathlib')
+            self.assertEqual(json.loads((project / 'lake-manifest.json').read_text())['packages'][0]['dir'], '../../..')
+            self.assertEqual((project / '.lake/build/lib/adapter.so').read_bytes(), b'compiled artifact')
+
+    def test_prepared_paths_survive_moving_the_checkout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            core = base / 'original'
+            mathlib = core / '.lake/packages/mathlib'
+            mathlib.mkdir(parents=True)
+            (core / 'lean-toolchain').write_text('leanprover/lean4:v4.34.1\n')
+            (core / 'lake-manifest.json').write_text(json.dumps({'packages': [
+                {'name': 'mathlib', 'type': 'git', 'rev': 'pin', 'url': 'https://example.com/mathlib'}]}))
+            fixture = core / 'slurmrunner/tests/ComparisonBenchmarkTests.lean'
+            fixture.parent.mkdir(parents=True)
+            fixture.write_text((HERE / 'tests/ComparisonBenchmarkTests.lean').read_text())
+            with patch.object(preparation, 'PROJECT', core):
+                registry = preparation.prepare(core / 'artifacts/provers', ['duper'])
+            raw = json.loads(registry.read_text())['backends']['duper']
+            self.assertFalse(Path(raw['project']).is_absolute())
+            self.assertFalse(Path(raw['shared_dependencies']['mathlib']['project']).is_absolute())
+            link = core / 'artifacts/provers/duper/.lake/packages/mathlib'
+            self.assertFalse(Path(os.readlink(link)).is_absolute())
+            self.assertNotIn(str(core), (core / 'artifacts/provers/duper/lakefile.lean').read_text())
+            moved = base / 'moved'
+            core.rename(moved)
+            spec = suite.isolated.load_backends(moved / 'artifacts/provers/backends.json')['duper']
+            self.assertEqual(Path(spec['project']), moved / 'artifacts/provers/duper')
+            self.assertEqual(Path(spec['shared_dependencies']['mathlib']['project']),
+                             moved / '.lake/packages/mathlib')
+            self.assertEqual((moved / 'artifacts/provers/duper/.lake/packages/mathlib').resolve(),
+                             moved / '.lake/packages/mathlib')
+
+    @unittest.skipUnless(shutil.which('rsync'), 'rsync required for node-local staging')
+    def test_scratch_staging_copies_shared_mathlib_only_once(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            core = base / 'core'
+            mathlib = core / '.lake/packages/mathlib'
+            toolchain = base / 'toolchain'
+            scratch = base / 'scratch'
+            scratch.mkdir()
+            for path in (mathlib / 'Mathlib.olean', mathlib / 'libMathlib.so',
+                         core / 'slurmrunner/run-hammer-task', toolchain / 'bin/lean'):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(path.name)
+            jobs = []
+            for name in ('one', 'two'):
+                project = core / 'artifacts' / name
+                packages = project / '.lake/packages'
+                packages.mkdir(parents=True)
+                (packages / 'mathlib').symlink_to(mathlib, target_is_directory=True)
+                (packages / 'auto').mkdir()
+                (packages / 'auto/version').write_text(name)
+                config = {'project': str(project), 'shared_core_project': str(core),
+                          'lean': str(toolchain / 'bin/lean'), 'lean_env': {},
+                          'lean_args': [f'--plugin={packages / "mathlib/libMathlib.so"}'],
+                          'shared_dependencies': {'mathlib': {'project': str(mathlib), 'revision': 'pin'}}}
+                path = base / f'{name}.json'
+                path.write_text(json.dumps(config))
+                jobs.append({'args': ['--config', str(path)]})
+            config = {'tool': 'hammer_bench.tool_info', 'jobs': jobs, 'workdir': str(base),
+                      'executable': str(core / 'slurmrunner/run-hammer-task')}
+            staged, directory = slurm.stage_hammer(config, scratch)
+            self.assertEqual(len(list(directory.rglob('Mathlib.olean'))), 1)
+            configs = [json.loads(Path(job['args'][1]).read_text()) for job in staged['jobs']]
+            self.assertEqual(configs[0]['lean_args'], configs[1]['lean_args'])
+            shutil.rmtree(core)
+            shutil.rmtree(toolchain)
+            for name, local in zip(('one', 'two'), configs):
+                packages = Path(local['project']) / '.lake/packages'
+                self.assertTrue((packages / 'mathlib').is_symlink())
+                self.assertTrue((packages / 'mathlib').resolve().is_relative_to(directory))
+                self.assertEqual((packages / 'mathlib/Mathlib.olean').read_text(), 'Mathlib.olean')
+                self.assertEqual((packages / 'auto/version').read_text(), name)
+
     def test_projects_do_not_force_other_provers_or_their_auto_versions(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             path = preparation.prepare(directory, list(preparation.BACKENDS))
             registry = suite.isolated.load_backends(path)
             self.assertEqual(set(registry), set(preparation.BACKENDS))
+            self.assertNotIn('lean-smt', registry)
+            self.assertTrue(all('cvc5' not in spec['requires'] for spec in preparation.BACKENDS.values()))
+            shared = preparation.shared_dependencies()
             for name in registry:
                 lakefile = (directory / name / 'lakefile.lean').read_text()
+                self.assertEqual(registry[name]['shared_dependencies'], shared)
+                for package, dependency in shared.items():
+                    link = directory / name / '.lake/packages' / package
+                    self.assertTrue(link.is_symlink())
+                    self.assertEqual(link.resolve(), Path(dependency['project']))
+                    self.assertIn(f'require {package} from git {json.dumps(dependency["url"])} '
+                                  f'@ {json.dumps(dependency["revision"])}', lakefile)
                 self.assertIn('require vampire_hammer_benchmark from', lakefile)
+                self.assertIn('precompileModules := true', lakefile)
+                self.assertIn('lean_lib Benchmark.Prover where', lakefile)
+                self.assertIn('defaultFacets := #[LeanLib.sharedFacet]', lakefile)
                 if name != 'vampire-hammer':
                     self.assertNotIn('require vampire_hammer from', lakefile)
                 if name not in {'duper', 'lean-auto-duper'}:
@@ -45,6 +163,7 @@ class IsolatedTests(unittest.TestCase):
                 if name in {'duper', 'vampire-hammer'}:
                     self.assertNotIn('require auto from', lakefile)
                 adapter = (directory / name / 'Benchmark/Prover.lean').read_text()
+                self.assertIn('import Mathlib.Init', adapter)
                 self.assertIn('import VampireHammerBenchmark.Comparison', adapter)
                 smoke = (directory / name / 'Smoke.lean').read_text()
                 self.assertIn(f'for prover in #["{name}"]', smoke)
@@ -62,6 +181,22 @@ class IsolatedTests(unittest.TestCase):
                         ['lake', 'build'], ['lake', 'lean', 'Smoke.lean']]
             self.assertEqual(commands, expected + expected)
             self.assertNotEqual(run.call_args_list[0].kwargs['cwd'], run.call_args_list[4].kwargs['cwd'])
+
+    def test_shared_dependency_path_and_revision_must_match(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            shared = project / 'baseline'
+            shared.mkdir()
+            (project / 'lake-manifest.json').write_text(json.dumps({'packages': [
+                {'name': 'mathlib', 'type': 'path', 'dir': str(shared)}]}))
+            spec = {'project': str(project), 'shared_dependencies': {
+                'mathlib': {'project': str(shared), 'revision': 'pinned'}}}
+            with patch.object(suite.isolated.subprocess, 'check_output', return_value='changed\n'), \
+                    self.assertRaisesRegex(ValueError, 'changed revision'):
+                suite.isolated.backend_config('simp_all', spec, None, suite.__dict__)
+            spec['shared_dependencies']['mathlib']['project'] = str(project / 'other')
+            with self.assertRaisesRegex(ValueError, 'must use shared dependency'):
+                suite.isolated.backend_config('simp_all', spec, None, suite.__dict__)
 
     def test_single_and_batched_cases_load_selected_adapter_without_foreign_options(self):
         for prover in preparation.BACKENDS:

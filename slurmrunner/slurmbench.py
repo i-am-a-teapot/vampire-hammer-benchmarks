@@ -902,26 +902,30 @@ def stage_hammer(cfg, scratch):
     try:
         mappings = {}
 
-        def copy_tree(source):
+        def copy_tree(source, shared_packages=()):
             source = Path(source).resolve()
             if not source.is_dir():
                 raise ValueError(f'Staging source directory does not exist: {source}')
             for old, new in mappings.items():
                 if source.is_relative_to(old):
-                    return new / source.relative_to(old)
+                    candidate = new / source.relative_to(old)
+                    if candidate.is_dir():
+                        return candidate
             target = root / f'tree-{len(mappings)}'
             target.mkdir()
             print(f'staging {source} -> {target}', flush=True)
             # Dereference dependency symlinks so reads cannot fall back to the
             # shared filesystem. No build runs on the compute node.
             subprocess.run(['rsync', '-aL', '--exclude=.git/', '--exclude=__pycache__/',
-                            '--exclude=/artifacts/', f'{source}/', f'{target}/'], check=True)
+                            '--exclude=/artifacts/',
+                            *[f'--exclude=/.lake/packages/{name}' for name in shared_packages],
+                            f'{source}/', f'{target}/'], check=True)
             mappings[source] = target
             return target
 
         def relocate(path):
             path = Path(path).resolve()
-            for old, new in mappings.items():
+            for old, new in sorted(mappings.items(), key=lambda item: len(item[0].parts), reverse=True):
                 if path.is_relative_to(old):
                     return str(new / path.relative_to(old))
             raise ValueError(f'Path is outside staged directories: {path}')
@@ -929,11 +933,14 @@ def stage_hammer(cfg, scratch):
         # Copy the runner checkout too if --project selected a separate build.
         executable = Path(cfg['executable']).resolve()
         for config in configs.values():
-            if not config.get('lean'):
-                raise ValueError('Regenerate the suite: staging requires a recorded Lean binary')
-            copy_tree(config['project'])
             if config.get('shared_core_project'):
                 copy_tree(config['shared_core_project'])
+        for config in configs.values():
+            if not config.get('lean'):
+                raise ValueError('Regenerate the suite: staging requires a recorded Lean binary')
+            for dependency in config.get('shared_dependencies', {}).values():
+                copy_tree(dependency['project'])
+            copy_tree(config['project'], config.get('shared_dependencies', {}))
             copy_tree(Path(config['lean']).resolve().parent.parent)
         copy_tree(executable.parent.parent)
         for config in configs.values():
@@ -965,6 +972,16 @@ def stage_hammer(cfg, scratch):
             for key in ('project', 'shared_core_project', 'lean', 'vampire', 'tptp_parser_dynlib'):
                 if local.get(key):
                     local[key] = relocate(local[key])
+            local['shared_dependencies'] = {}
+            for name, dependency in config.get('shared_dependencies', {}).items():
+                target = relocate(dependency['project'])
+                local['shared_dependencies'][name] = dict(dependency, project=target)
+                link = Path(local['project']) / '.lake/packages' / name
+                link.parent.mkdir(parents=True, exist_ok=True)
+                if not link.is_symlink():
+                    link.symlink_to(target, target_is_directory=True)
+                elif link.resolve() != Path(target):
+                    raise ValueError(f'Staged shared dependency points to the wrong directory: {link}')
             local['lean_env'] = dict(config.get('lean_env', {}))
             for key in ('LEAN_PATH', 'LEAN_SRC_PATH', 'LD_LIBRARY_PATH', 'DYLD_LIBRARY_PATH'):
                 if key in local['lean_env']:

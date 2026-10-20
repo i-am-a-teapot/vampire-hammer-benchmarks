@@ -246,6 +246,28 @@ class RepositoryTests(unittest.TestCase):
         # Plugins can link against the dynlibs, which therefore load first.
         self.assertEqual(flags, ["--load-dynlib=/lib/parser.so", "--plugin=/lib/hammer.so"])
 
+    def test_native_flags_require_built_and_loaded_benchmark_libraries(self):
+        setup = {'plugins': [{'path': '/lib/core.so'}, {'path': '/lib/adapter.so'}]}
+        probe = subprocess.CompletedProcess([], 0, '', 'module setup: ' + json.dumps(setup) + '\n')
+        core = subprocess.CompletedProcess([], 0, '"/lib/core.so"\n', '')
+        adapter = subprocess.CompletedProcess([], 0, '"/lib/adapter.so"\n', '')
+        with patch.object(suite.subprocess, 'run', side_effect=[probe, core, adapter]):
+            flags = suite.native_lean_args(required_libraries=['Core', 'Adapter'])
+        self.assertEqual(flags, ['--plugin=/lib/core.so', '--plugin=/lib/adapter.so'])
+        missing = subprocess.CompletedProcess([], 0, '"/lib/missing.so"\n', '')
+        with patch.object(suite.subprocess, 'run', side_effect=[probe, missing]), \
+                self.assertRaisesRegex(ValueError, 'is not loaded'):
+            suite.native_lean_args(required_libraries=['Missing'])
+        dynlib_only = subprocess.CompletedProcess([], 0, '', 'module setup: ' +
+                                                 json.dumps({'dynlibs': ['/lib/adapter.so']}) + '\n')
+        with patch.object(suite.subprocess, 'run', side_effect=[dynlib_only, adapter]), \
+                self.assertRaisesRegex(ValueError, 'not loaded as a Lean plugin'):
+            suite.native_lean_args(required_libraries=['Adapter'])
+        unbuilt = subprocess.CompletedProcess([], 1, '', 'needs rebuilding')
+        with patch.object(suite.subprocess, 'run', side_effect=[probe, unbuilt]), \
+                self.assertRaisesRegex(ValueError, 'is not built'):
+            suite.native_lean_args(required_libraries=['Missing'])
+
     def test_native_flags_reject_hammer_loaded_before_lean_auto(self):
         setup = {"plugins": [{"path": "/lib/libauto_Auto.so"}],
                  "dynlibs": ["/lib/libvampire__hammer_VampireHammer.so"]}

@@ -9,8 +9,9 @@ python3 slurmrunner/make-suite.py --backends artifacts/provers/backends.json \
 ```
 
 Repeat `--prover NAME` to select projects when preparing or generating a suite.
-The projects share only the benchmark harness and pinned corpus, not `auto`
-packages or tactic imports. Environment replay, premise selection,
+The projects share the benchmark harness, Mathlib and its pinned dependency
+checkouts/build caches. Solver-specific packages such as `auto` remain separate.
+Environment replay, premise selection,
 kernel check, target-reuse audit and Slurm runner remain shared. Backend imports
 can differ; targets already imported by a tactic are excluded uniformly.
 
@@ -61,14 +62,9 @@ resources for your cluster. For an FO-only or HO-only VampireHammer run, add
 ## Solver dependencies and eligibility
 
 `prepare-provers.py` prepares `vampire-hammer`, `duper`, `aesop`, `simp_all`,
-`grind`, `lean-auto-duper`, and `lean-smt`. Select a subset with repeatable
+`grind`, and `lean-auto-duper`. Select a subset with repeatable
 `--prover NAME` arguments. All projects use the same preparation and build
 sequence, and each adapter imports only its own tactic dependencies.
-
-Lean-SMT uses the cvc5 FFI rather than a `cvc5` executable on `PATH`; native
-build requirements are documented by [lean-cvc5](https://github.com/abdoo8080/lean-cvc5).
-Its adapter runs `smt +mono -trust -native [*, premises]`. Only reconstructed,
-kernel-checked proofs count as successes.
 
 Suite generation verifies matching Lean and Mathlib versions and records each
 backend's dependency revisions, imports, adapter and runtime configuration.

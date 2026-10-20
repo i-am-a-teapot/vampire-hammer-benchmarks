@@ -1,0 +1,20 @@
+# Only send benchmark sources to the builder; exclude local caches and credentials.
+**
+!Dockerfile
+!lean-toolchain
+!lakefile.lean
+!lake-manifest.json
+!LICENCE
+!VampireHammerBenchmark.lean
+!VampireHammerBenchmark/
+!VampireHammerBenchmark/**
+!scripts/
+!scripts/**
+!slurmrunner/
+!slurmrunner/**
+!Tests/
+!Tests/**
+!docker/
+!docker/**
+**/__pycache__/**
+**/*.pyc

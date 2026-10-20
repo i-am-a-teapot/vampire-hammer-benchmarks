@@ -2,8 +2,12 @@
 
 The isolated-project refactor was checked with Lean 4.34.1 and Python 3.14:
 
-- All 101 Python tests and both shared-core Lean regressions pass.
+- All 104 Python tests and both shared-core Lean regressions pass.
 - The core builds without Vampire-Hammer, Duper or lean-auto dependencies.
+- The harness, Mathlib and adapters load native shared libraries. Native
+  `simp_all`, Duper and lean-auto+Duper builds pass replay smoke tests; single-case and batched
+  local execution use the recorded native library flags. Suite generation
+  rejects missing or unloaded native libraries.
 - Independent `simp_all` and Duper projects build and pass their replay smoke
   tests, including premise extraction, kernel checking and same-command exclusion.
 - Duper resolves upstream lean-auto at `6b2774cde4d1cb7ac4d48ac61c34e950e0588d69`;
@@ -12,9 +16,12 @@ The isolated-project refactor was checked with Lean 4.34.1 and Python 3.14:
   replay by module, and collects all four results for two Mathlib theorems
   through the same worker and collector used by Slurm. Proof successes and
   unsuccessful tactic attempts remain separate outcomes.
-- Python regressions cover all seven project templates, equal build sequences,
+- Python regressions cover all six project templates, equal build sequences,
   per-backend Slurm configurations, module-path isolation, stale-source checks,
   subset comparison denominators, local execution and resume.
+- Mathlib and its dependency directories are shared with their original Git
+  pins. Mathlib's own cache-compatibility check passes. Scratch staging keeps
+  one local baseline copy while preserving separate solver dependencies.
 
 No Slurm jobs were submitted. The remaining native solver environments were
 not rebuilt as part of this refactor; their generated adapters use the existing

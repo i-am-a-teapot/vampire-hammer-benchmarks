@@ -6,6 +6,15 @@ run several tactics on the same eligible theorems. Successful results require
 a kernel-checked proof without `sorryAx` or reuse of the target theorem.
 
 Follow the [build and run instructions](../README.md) for a comparison suite.
+For full preparation on a compute node, run
+`sbatch slurmrunner/prepare-global.sbatch` from the repository root in your
+existing Python/Lean environment. It builds all six provers and generates the
+entire compact suite in `artifacts/suite/`, using all
+allocated CPU workers. Mathlib and its pinned dependency caches are shared
+across the prover projects.
+Change `DEFAULT_OUTPUT` near the top of the Slurm file, or pass
+`--output DIR` after the filename in the `sbatch` command.
+
 For Vampire-Hammer alone, generate a suite with:
 
 ```sh

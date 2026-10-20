@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Each prover builds in an isolated Lake project with the root Mathlib caches. -->
+<prover-environment version="1">
+  <prover file="provers/vampire-hammer.xml"/>
+  <prover file="provers/grind.xml"/>
+</prover-environment>

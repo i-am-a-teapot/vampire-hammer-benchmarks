@@ -11,7 +11,10 @@ python3 scripts/make-suite.py --definition configurations/normal.xml \
 ```
 
 Omit `--build` to generate projects without fetching or compiling dependencies.
-Use a fresh output directory; existing environments are never overwritten.
+Rerun the same command to refresh generated files and resume an interrupted build.
+Unchanged files retain their timestamps; dependency checkouts, build caches and
+unselected provers are preserved. Replaced shared-package directories are archived
+under the project's `.lake/previous-packages/`.
 Repeat `--prover NAME` to select a subset. A single prover XML can also be passed
 directly to `--definition`.
 
@@ -56,9 +59,16 @@ shared packages must keep the same Git URL and commit.
 
 Preparation writes `backends.json`, definition snapshots and generated
 `Benchmark/Prover.lean`, `lakefile.lean`, `lean-toolchain`, and `Smoke.lean` files.
-With `--build`, every project runs the same Lake update, cache, build and smoke
-check sequence. The registry records source pins and definition hashes.
+With `--build`, each selected project runs Lake cache, build and smoke checks.
+Add `--no-cache` to compile locally without Mathlib or Lake cache downloads,
+including Mathlib's automatic cache hook during dependency updates.
+`--build-jobs N` limits Lean build threads and native Vampire compile jobs.
+Lake updates dependencies when the lockfile is missing or its pins differ.
+A first-time Vampire build that finishes compiling but fails because Lake retained
+the initial empty-checkout HEAD probe error is retried once with the initialized
+checkout. Other build failures remain errors. The registry records source pins
+and definition hashes.
 
 Keep case options in experiment files such as `normal.xml`. Prover definitions
 and the generated build registry contain no case options. After changing a pin
-or wrapper, prepare a fresh environment and regenerate execution suites.
+or wrapper, rerun preparation and regenerate execution suites.

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Prepared environment for the normal_small.xml experiment. -->
+<prover-environment version="1">
+  <prover file="provers/vampire-hammer.xml"/>
+  <prover file="provers/grind.xml"/>
+</prover-environment>

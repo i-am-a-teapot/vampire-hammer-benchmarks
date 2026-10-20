@@ -35,8 +35,8 @@ printf 'Building with %s CPU workers\n' "$LEAN_NUM_THREADS"
 
 mkdir -p "$output"
 output="$(cd "$output" && pwd)"
-if [[ -e "$output/provers" || -e "$output/suite" ]]; then
-  echo "Provers or suite already exist in $output; choose a fresh output directory." >&2
+if [[ -e "$output/suite" ]]; then
+  echo "Suite already exists in $output; choose a fresh suite output directory." >&2
   exit 2
 fi
 trap 'status=$?; printf "Preparation failed (exit %s). Files: %s\n" "$status" "$output" >&2; exit "$status"' ERR

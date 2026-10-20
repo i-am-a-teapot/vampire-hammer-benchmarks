@@ -1,97 +1,97 @@
-# Docker
+# Docker BenchExec sample
 
-The image consumes the repositories already compiled by the normal build commands:
+The image contains sources, build tools and BenchExec. On first startup it downloads
+the pinned Lean toolchain, fetches the locked dependencies, and compiles Mathlib,
+the benchmark harness and the selected provers **without downloading build caches**.
+Then it generates a sample and runs BenchExec automatically.
 
-```sh
-lake update
-lake exe cache get
-lake build
-python3 scripts/prepare-provers.py --definition configurations/provers.xml \
-  --output artifacts/provers --build
-```
+The compiled environment lives in a persistent Docker volume, keeping those large
+files out of the image. A full Mathlib source build takes substantial time and
+still needs several GB of disk space in the volume. Interrupted builds resume;
+subsequent runs reuse a completed environment.
 
-These commands put shared compiled dependencies in the checkout's `.lake/` and
-prover-specific builds in `artifacts/provers/`. Supply both, together with the
-matching sources and manifests. An `artifacts/provers/` directory alone is not
-sufficient. Keep package Git metadata and the shared dependency symlinks.
-Build artifacts must be from Linux x86-64 with system libraries compatible with
-Ubuntu 24.04; builds produced on macOS or ARM64 cannot be used.
-
-Prepared prover projects use relative paths in their Lake dependencies,
-registry, and shared-package symlinks.
-
-Stage the prepared checkout and its pinned Lean toolchain in a separate artifacts
-directory, excluding local credentials and unrelated benchmark output. From the
-checkout used to compile:
+Build and run from the repository root; no host Lean installation or precompiled
+checkout is needed:
 
 ```sh
-mkdir -p artifacts/docker-precompiled/checkout artifacts/docker-precompiled/toolchain
-precompiled_dir="$(cd artifacts/docker-precompiled && pwd -P)"
-cp -a lean-toolchain lakefile.lean lake-manifest.json LICENCE \
-  VampireHammerBenchmark.lean VampireHammerBenchmark scripts slurmrunner Tests configurations docs \
-  .lake "$precompiled_dir/checkout/"
-mkdir -p "$precompiled_dir/checkout/artifacts"
-cp -a artifacts/provers "$precompiled_dir/checkout/artifacts/"
-cp -a "$(lean --print-prefix)/." "$precompiled_dir/toolchain/"
+docker build -t vampire-hammer-benchmark:sample .
+docker volume create vampire-hammer-build
+mkdir -p artifacts/docker-results
 
-docker buildx build --load --platform linux/amd64 \
-  --build-context precompiled="$precompiled_dir" \
-  -t vampire-hammer-benchmark .
+docker run --rm --privileged --cap-drop=ALL --cgroupns=private \
+  --mount type=volume,src=vampire-hammer-build,dst=/var/lib/benchmark \
+  --mount type=bind,src="$(pwd)/artifacts/docker-results",dst=/results \
+  vampire-hammer-benchmark:sample \
+  --count 1000 --jobs 1 --output /results/large-1000
 ```
 
-The supplied directory has two entries: `checkout/` contains the matching sources,
-root `.lake/`, and `artifacts/provers/`; `toolchain/` contains the pinned Lean
-installation (`bin/`, `lib/`, etc.). Use a fresh staging directory when packaging
-a different build. You can reuse this directory for later image builds.
+The first startup needs internet access for the Lean release and Git checkouts.
+Lean uses the official prebuilt compiler pinned in `lean-toolchain`; Mathlib,
+the harness, tactic libraries and Vampire are compiled inside the container.
+Defaults are `normal_small.xml` and `provers_sample.xml` (Vampire-Hammer + `grind`),
+100 sampled theorems and one benchmark worker. `--build-jobs 2` controls compilation
+parallelism independently of BenchExec's `--jobs`. Use a fresh output path per run.
 
-The image relocates the checkout to `/opt/benchmark` and the toolchain to
-`/opt/lean`; no original host directory is required. Preserve symlinks when
-copying and keep dependencies inside the checkout.
-
-Image construction installs system runtime libraries, so it needs internet access
-for Ubuntu packages. Lean and all repository builds are copied from the supplied
-artifacts; the image does not run `lake update`, `lake exe cache get`, or
-`lake build`, or download a Lean toolchain. With networking disabled, it extracts
-the theorem catalog using `lake --no-build` and checks that a sample suite can be
-prepared for all six backends. Missing or incompatible artifacts cause the image
-build to fail. Benchmark-specific source replay and proof attempts still happen
-at runtime.
-
-The default backends are Vampire-Hammer, Duper, Aesop, `simp_all`, `grind`, and
-lean-auto+Duper.
-
-Run the benchmark offline and persist the suite, logs, and results on the host:
+To prepare the volume separately, without starting BenchExec:
 
 ```sh
-mkdir -p results
-docker run --rm --init --network none \
-  --mount type=bind,src="$(pwd)/results",dst=/results \
-  vampire-hammer-benchmark
+docker run --rm \
+  --mount type=volume,src=vampire-hammer-build,dst=/var/lib/benchmark \
+  vampire-hammer-benchmark:sample --prepare-only --build-jobs 2
 ```
 
-Startup automatically runs all six backends on the same 2,000 theorems, with
-16 parallel jobs and batches of up to 16 theorems from one module. Selection uses
-the existing module-balanced, seeded sampler with seed `mathlib-v4.34.1-docker`;
-the same image and seed reproduce the sample. The comparison uses the existing
-10-second proof-success and search budgets. Size container resources for 16
-concurrent Lean processes, or lower `--jobs` on smaller machines.
+Once preparation completes, add `--network none` to benchmark commands for offline
+runs. Always mount the same build volume. Only one container may use it at a time;
+use separate volumes for concurrent runs. Changed image sources or prover
+definitions create a separate workspace in the volume. Existing builds are kept.
+Use a new volume when you want a completely fresh compilation.
 
-Arguments after the image name are forwarded to the local runner. For example:
+To build all six provers and select the standard experiment:
 
 ```sh
-docker run --rm --init --network none \
-  --mount type=bind,src="$(pwd)/results",dst=/results \
-  vampire-hammer-benchmark \
-  --count 100 --jobs 4 --seed experiment-2 \
-  --prover vampire-hammer --prover duper --output /results/experiment-2
-
-docker run --rm --network none vampire-hammer-benchmark --help
+docker build \
+  --build-arg PROVERS=configurations/provers.xml \
+  --build-arg EXPERIMENT=configurations/normal.xml \
+  -t vampire-hammer-benchmark:full .
 ```
 
-The default output is `/results/run`, containing `suite/` and `results/`.
-A fresh run refuses to overwrite an existing output directory; use a new
-`--output` path or pass `--resume` to continue that directory's saved suite.
-Resume uses the saved sample and prover configuration. Keep the image and both
-output directories together: suite paths refer to their original container
-locations. No downloads or dependency builds are required at runtime.
+Run this image with another build volume. `SAMPLE_SIZE` and `JOBS` also set image
+build defaults. Runtime flags override them. `--seed` controls reproducible
+sampling, and repeatable `--prover NAME` restricts the experiment's runs.
 
+Mount an experiment XML to select it without rebuilding the image:
+
+```sh
+docker run --rm --privileged --cap-drop=ALL --cgroupns=private --network none \
+  --mount type=volume,src=vampire-hammer-build,dst=/var/lib/benchmark \
+  --mount type=bind,src="$(pwd)/artifacts/docker-results",dst=/results \
+  --mount type=bind,src="$(pwd)/configurations/normal_small.xml",dst=/configuration.xml,readonly \
+  vampire-hammer-benchmark:sample \
+  --definition /configuration.xml --count 25 --output /results/custom
+```
+
+`--prover-definition PATH` selects another prover environment XML at startup.
+Mount its referenced XML files too, and allow network access for its initial build.
+Relative default definition paths resolve inside the copied checkout; absolute
+paths refer to mounted files. Experiment task paths resolve beside their XML;
+mount any referenced catalogs or saved selections as well. With no task source,
+the image uses its cached Mathlib catalog. `--count` can sample a saved selection.
+
+The Docker permissions above provide BenchExec writable cgroups for enforcing the
+XML's resource limits; see the [BenchExec container instructions](https://github.com/sosy-lab/benchexec/blob/main/doc/benchexec-in-container.md).
+Do not add `--init`: startup replaces itself with BenchExec, preserving its exit
+status and keeping it the sole container process before workers start.
+
+Host output contains `suite/`, BenchExec XML and zipped logs under `results/`,
+and `benchexec-command.json`. For normalized theorem results:
+
+```sh
+python3 scripts/collect-results.py artifacts/docker-results/large-1000/results \
+  --suite artifacts/docker-results/large-1000/suite \
+  --jsonl artifacts/docker-results/large-1000.jsonl
+```
+
+Runtime defaults can also be set with `BENCHMARK_COUNT`, `BENCHMARK_JOBS`,
+`BENCHMARK_BUILD_JOBS`, `BENCHMARK_SEED`, `BENCHMARK_OUTPUT`, `BENCHMARK_DEFINITION`
+and `BENCHMARK_PROVERS`. Use `--extract-only` to export a suite without benchmarking,
+`--benchexec-arg=ARGUMENT` for additional BenchExec flags, or `--help` for options.

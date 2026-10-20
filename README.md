@@ -18,8 +18,9 @@ python3 scripts/prepare-provers.py --definition configurations/provers.xml \
   --output artifacts/provers --build
 ```
 
-Repeat `--prover NAME` to prepare a subset. Existing prover directories are never
-overwritten. Rebuild and regenerate suites after source or dependency changes.
+Repeat `--prover NAME` to prepare or refresh a subset. Rerunning updates generated
+files and resumes builds using existing checkouts and caches. Regenerate execution
+suites after source or dependency changes.
 Repository pins, checkout directories, imports and tactic wrappers are defined
 in [prover XML files](configurations/README.md); case options belong to experiments.
 For cluster preparation, `sbatch slurmrunner/prepare-global.sbatch` builds all
@@ -98,6 +99,11 @@ or replace it with `--test-suite artifacts/mathlib-cases` to reuse a saved selec
 Use fresh output directories and keep suites and raw results together.
 See [suite options](scripts/README.md), [Slurm execution](slurmrunner/README.md),
 [methodology and analysis](docs/comparison.md), and [Docker usage](docker/README.md).
+
+The [Docker walkthrough](docker/README.md) builds a small source-only image that
+compiles Mathlib and the selected provers into a persistent volume on first startup,
+then runs a configurable BenchExec sample. Defaults are `normal_small.xml` and
+`provers_sample.xml` (Vampire-Hammer and `grind`); `--count` controls sample size.
 
 ## Validation
 

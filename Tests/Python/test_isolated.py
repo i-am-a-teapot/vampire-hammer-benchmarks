@@ -226,8 +226,7 @@ class IsolatedTests(unittest.TestCase):
                 self.assertIn(f'for prover in #["{name}"]', smoke)
                 self.assertIn('options.set `benchmark.adapterModule "Benchmark.Prover"', smoke)
             original = (directory / 'duper/lakefile.lean').read_bytes()
-            with self.assertRaisesRegex(ValueError, 'already exists'):
-                preparation.prepare(directory, ['grind', 'duper'])
+            preparation.prepare(directory, ['grind', 'duper'])
             self.assertEqual(original, (directory / 'duper/lakefile.lean').read_bytes())
 
     def test_all_provers_use_the_same_build_sequence(self):

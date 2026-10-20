@@ -32,6 +32,23 @@ suite = load("make_suite", "make-suite.py")
 
 class RepositoryTests(unittest.TestCase):
 
+    def test_saved_testcases_can_be_sampled_without_losing_ids(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            rows = [{'id': index, 'name': f'Nat.test{index}', 'module': 'Mathlib.Test'}
+                    for index in (12, 27, 42)]
+            (root / 'selection.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in rows))
+            (root / 'test-suite.json').write_text(json.dumps({
+                'version': 1, 'strategy': 'lean-auto', 'eligible_theorems': 100}))
+            args = types.SimpleNamespace(test_suite=root, strategy='lean-auto', names=None, count=2, seed='sample')
+            with patch.object(suite, 'catalog_rows', side_effect=AssertionError('must reuse saved cases')):
+                selected, eligible = suite.select(args, root)
+                repeated, _ = suite.select(args, root)
+            self.assertEqual(selected, repeated)
+            self.assertEqual(len(selected), 2)
+            self.assertEqual(eligible, 100)
+            self.assertTrue(all(row in rows for row in selected))
+
     def test_benchexec_export_uses_standard_xml_and_quotes_task_filenames(self):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)

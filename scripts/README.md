@@ -48,8 +48,10 @@ using each build's registered options and recorded in `omitted_case_options`.
 Protocol heartbeat limits remain zero. Run names identify separate configs and
 result groups, even for the same prover.
 
-`<tasks>` also accepts `--catalog`, `--names`, `--count` and `--seed` instead of
-`--test-suite`. Root attributes accept `success-seconds`, `hardtimelimit`,
+`<tasks>` also accepts `--catalog`, `--names`, `--count` and `--seed`.
+Combine `--test-suite` with `--count` and `--seed` to sample a saved selection;
+testcase IDs are preserved. `--catalog` and `--test-suite` are alternative sources.
+Root attributes accept `success-seconds`, `hardtimelimit`,
 `walltimelimit` and `cpu-cores`. CLI selection values and process limits override
 XML values. This is a BenchExec-inspired input format, not a general XML importer.
 

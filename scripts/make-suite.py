@@ -143,16 +143,19 @@ def catalog_rows(args, output):
 
 def select(args, output):
     """Rows with name, module and stable testcase IDs."""
-    if getattr(args, 'test_suite', None):
+    reuse = getattr(args, 'test_suite', None)
+    if reuse:
         root = args.test_suite.resolve()
         metadata = json.loads((root / 'test-suite.json').read_text())
         if metadata.get('version') != 1:
             raise ValueError('expected a version 1 test suite')
         if metadata['strategy'] != args.strategy:
             raise ValueError('test suite strategy differs from the requested strategy')
-        return benchmark.read_rows(root / 'selection.jsonl'), metadata['eligible_theorems']
-    rows = catalog_rows(args, output)
-    eligible = len(rows)
+        rows = benchmark.read_rows(root / 'selection.jsonl')
+        eligible = metadata['eligible_theorems']
+    else:
+        rows = catalog_rows(args, output)
+        eligible = len(rows)
     if args.names:
         requested = [line.strip() for line in args.names.read_text().splitlines() if line.strip()]
         by_name = {row["name"]: row for row in rows}
@@ -160,12 +163,13 @@ def select(args, output):
         if missing:
             sys.exit(f"{len(missing)} names are not public mathlib theorems, e.g. {missing[:5]}")
         rows = [by_name[name] for name in dict.fromkeys(requested)]
-    elif args.count:
+    if args.count:
         rows = benchmark.sample(rows, args.count, args.seed)
-    else:
+    elif not reuse and not args.names:
         rows = sorted(rows, key=lambda row: (row["module"], row["name"]))
-    for index, row in enumerate(rows):
-        row["id"] = index
+    if not reuse:
+        for index, row in enumerate(rows):
+            row["id"] = index
     return rows, eligible
 
 
@@ -367,8 +371,8 @@ def main():
     args.compact = args.format == 'slurm'
     if not args.tasks_only and not args.backends:
         parser.error('--backends is required unless --tasks-only is used')
-    if args.test_suite and any((args.catalog, args.names, args.count)):
-        parser.error('--test-suite cannot be combined with other selection options')
+    if args.test_suite and args.catalog:
+        parser.error('--test-suite and --catalog are alternative testcase sources')
     args.search_seconds = args.search_seconds or [10]
     if args.count is not None and args.count <= 0 or args.shard_size <= 0:
         parser.error('--count and --shard-size must be positive')
